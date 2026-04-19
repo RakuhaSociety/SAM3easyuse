@@ -1,0 +1,67 @@
+# =============================================================
+# SAM3mmgp 完整依赖  (Python 3.12, CUDA 12.8, Windows)
+# =============================================================
+# 安装方式:
+#   1. 先装 PyTorch (需要额外 index-url):
+#      pip install torch==2.9.0+cu128 torchvision==0.24.0+cu128 torchaudio==2.9.0+cu128 --index-url https://download.pytorch.org/whl/cu128
+#
+#   2. 再装 Flash Attention 2 (需要预编译 whl):
+#      pip install flash_attn==2.8.3
+#      (从 https://github.com/bdashore3/flash-attention/releases 下载对应 torch2.9+cu128+python3.12 的 whl)
+#
+#   3. 安装本文件中其余依赖:
+#      pip install -r requirements.txt
+#
+#   4. 本地安装 sam3:
+#      cd sam3 && pip install -e .
+# =============================================================
+
+# ---------- PyTorch 系列 (通过 --index-url 安装, 此处仅做记录) ----------
+# torch==2.9.0+cu128
+# torchvision==0.24.0+cu128
+# torchaudio==2.9.0+cu128
+# triton-windows==3.6.0.post26   # torch 自动拉取
+
+# ---------- Flash Attention 2 (预编译 whl) ----------
+# flash_attn==2.8.3
+
+# ---------- SAM3 核心依赖 ----------
+timm>=1.0.26
+numpy>=1.26,<2
+tqdm>=4.67
+ftfy==6.1.1
+regex
+iopath>=0.1.10
+typing_extensions>=4.15
+huggingface_hub>=1.11
+
+# ---------- SAM3 运行时实际需要 (pyproject.toml 未声明但代码 import 了) ----------
+pycocotools>=2.0.11
+opencv-python>=4.11
+pandas>=2.3
+einops>=0.8.2
+decord>=0.6.0
+safetensors>=0.7.0
+
+# ---------- Gradio Web UI ----------
+gradio>=5.50.0
+
+# ---------- Gradio / FastAPI 传递依赖 (关键的记录一下) ----------
+fastapi>=0.136.0
+uvicorn>=0.44.0
+pydantic>=2.12
+orjson>=3.11
+aiofiles>=24.1
+ffmpy>=1.0
+pydub>=0.25.1
+httpx>=0.28
+websockets>=15.0
+rich>=15.0
+
+# ---------- 其他工具 ----------
+pillow>=11.3
+PyYAML>=6.0
+psutil>=7.2
+sympy>=1.14
+Jinja2>=3.1
+portalocker>=3.2

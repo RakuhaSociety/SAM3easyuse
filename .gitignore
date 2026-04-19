@@ -1,0 +1,44 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+*.egg
+dist/
+build/
+
+# ===== 虚拟环境 =====
+SAM3mmgp_env/
+SAM3tools_env/
+*.env/
+.venv/
+
+# ===== 模型权重 (太大, 放 Release 或自行下载) =====
+sam3/checkpoints/*.pt
+sam3/checkpoints/*.pth
+sam3/checkpoints/*.bin
+sam3/checkpoints/*.safetensors
+
+# ===== Flash Attention whl (放 Release) =====
+*.whl
+
+# ===== FFmpeg (放 Release 或用户自行下载) =====
+ffmpeg-*/
+
+# ===== 运行输出 =====
+outputs/
+
+# ===== IDE / 编辑器 =====
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ===== 系统文件 =====
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# ===== 日志 =====
+*.log
