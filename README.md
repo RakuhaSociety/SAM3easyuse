@@ -5,21 +5,24 @@
 ## 功能
 
 ### 图片处理
-| 模式 | 说明 |
-|------|------|
-| 📝 文本分割 | 输入文字描述，自动检测并分割目标 |
-| 🔲 框选分割 | 画框标记区域，可结合文本提示 |
-| 👆 点击分割 | 点击标记前景/背景点，交互式分割 |
+
+| 模式        | 说明                              |
+| ----------- | --------------------------------- |
+| 📝 文本分割 | 输入文字描述，自动检测并分割目标  |
+| 🔲 框选分割 | 画框标记区域，可结合文本提示      |
+| 👆 点击分割 | 点击标记前景/背景点，交互式分割   |
 | 📦 批量分割 | 文件夹批量处理 / 视频拆帧批量处理 |
 
 ### 视频跟踪
-| 模式 | 说明 |
-|------|------|
-| 📝 文本跟踪 | 文本描述目标，全视频自动跟踪 |
-| 👆 点击跟踪 | 在任意帧点击标记，向前后传播跟踪 |
+
+| 模式        | 说明                                 |
+| ----------- | ------------------------------------ |
+| 📝 文本跟踪 | 文本描述目标，全视频自动跟踪         |
+| 👆 点击跟踪 | 在任意帧点击标记，向前后传播跟踪     |
 | 🔲 框选跟踪 | 框选目标区域，可结合文本，全视频跟踪 |
 
 ### 通用特性
+
 - 支持 **SAM3 / SAM3.1** 模型切换
 - 支持 **Flash Attention 2** 开关（加速推理）
 - 视频跟踪支持 **自选中间帧** 标注（非仅首帧）
@@ -42,6 +45,7 @@ cd SAM3easyuse
 ```
 
 > `--recursive` 会自动拉取 sam3 子模块。如果忘了加，后续执行：
+>
 > ```bash
 > git submodule update --init --recursive
 > ```
@@ -49,13 +53,13 @@ cd SAM3easyuse
 ### 2. 创建 Python 环境
 
 ```bash
-conda create -p SAM3mmgp_env python=3.12 -y
+conda create -p SAM3easyuse_env python=3.12 -y
 ```
 
 ### 3. 安装 PyTorch（CUDA 12.8）
 
 ```bash
-SAM3mmgp_env\python.exe -m pip install torch==2.9.0+cu128 torchvision==0.24.0+cu128 torchaudio==2.9.0+cu128 --index-url https://download.pytorch.org/whl/cu128
+SAM3easyuse_env\python.exe -m pip install torch==2.9.0+cu128 torchvision==0.24.0+cu128 torchaudio==2.9.0+cu128 --index-url https://download.pytorch.org/whl/cu128
 ```
 
 ### 4. 安装 Flash Attention 2
@@ -63,7 +67,7 @@ SAM3mmgp_env\python.exe -m pip install torch==2.9.0+cu128 torchvision==0.24.0+cu
 从 [Release](https://github.com/RakuhaSociety/SAM3easyuse/releases) 下载预编译 whl：
 
 ```bash
-SAM3mmgp_env\python.exe -m pip install flash_attn-2.8.3+cu128torch2.9.0cxx11abiTRUE-cp312-cp312-win_amd64.whl
+SAM3easyuse_env\python.exe -m pip install flash_attn-2.8.3+cu128torch2.9.0cxx11abiTRUE-cp312-cp312-win_amd64.whl
 ```
 
 > 如果你的环境不匹配此 whl，可以在 Gradio UI / CLI 中关闭 Flash Attention（`--no-fa`），程序会回退到 SDPA。
@@ -71,20 +75,21 @@ SAM3mmgp_env\python.exe -m pip install flash_attn-2.8.3+cu128torch2.9.0cxx11abiT
 ### 5. 安装其余依赖
 
 ```bash
-SAM3mmgp_env\python.exe -m pip install -r requirements.txt
+SAM3easyuse_env\python.exe -m pip install -r requirements.txt
 ```
 
 ### 6. 安装 SAM3
 
 ```bash
 cd sam3
-..\SAM3mmgp_env\python.exe -m pip install -e .
+..\SAM3easyuse_env\python.exe -m pip install -e .
 cd ..
 ```
 
 ### 7. 下载模型权重
 
 将以下文件放入 `sam3/checkpoints/` 目录：
+
 - `sam3.pt` — SAM3 模型
 - `sam3.1_multiplex.pt` — SAM3.1 模型
 
@@ -96,10 +101,8 @@ cd ..
 
 ### Gradio Web UI
 
-双击 `启动gradio.bat`，或：
-
 ```bash
-SAM3mmgp_env\python.exe gradio_app.py
+SAM3easyuse_env\python.exe gradio_app.py
 ```
 
 浏览器打开 `http://localhost:7860`。
@@ -133,6 +136,7 @@ python inference.py video-box -v input.mp4 --box 100,50,400,300 -t "person" -o t
 ```
 
 通用选项：
+
 - `--model sam3.1` — 使用 SAM3.1 模型
 - `--mask` — 输出二值 Mask
 - `--no-fa` — 禁用 Flash Attention
@@ -164,7 +168,6 @@ SAM3easyuse/
 ├── gradio_app.py        # Gradio Web UI
 ├── inference.py         # SAM3Inference 类 + CLI
 ├── requirements.txt     # Python 依赖
-├── 启动gradio.bat       # 一键启动脚本
 ├── sam3/                # SAM3 源码 (git submodule)
 │   ├── checkpoints/     # 模型权重 (需自行下载)
 │   └── ...
