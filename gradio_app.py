@@ -21,6 +21,16 @@ import numpy as np
 import torch
 from PIL import Image
 
+try:
+    from mmgp import offload as _mmgp_offload
+    from mmgp import profile_type as _mmgp_profile_type
+
+    _MMGP_AVAILABLE = True
+except Exception:
+    _mmgp_offload = None
+    _mmgp_profile_type = None
+    _MMGP_AVAILABLE = False
+
 # ============================================================
 # 路径配置
 # ============================================================
@@ -54,6 +64,9 @@ _interactive_processor = None
 _video_predictors = {}  # key: "sam3" or "sam3.1"
 _video_use_fa = True   # 当前视频模型是否使用 Flash Attention
 _active_mode = None  # "image_sam3", "image_sam3.1", "interactive_sam3", "interactive_sam3.1", "video_sam3", "video_sam3.1"
+_mmgp_enabled = False
+_mmgp_profile = 4
+_mmgp_applied = set()
 
 COLORS = [
     (230, 25, 75), (60, 180, 75), (255, 225, 25), (0, 130, 200),
@@ -109,6 +122,122 @@ def _ensure_mode(mode):
     print(f"[SAM3] 模式切换 → {mode} (当前显存: {vram:.0f} MB)")
 
 
+def _set_mmgp_config(enabled=False, profile=4):
+    global _mmgp_enabled, _mmgp_profile
+    _mmgp_enabled = bool(enabled)
+    _mmgp_profile = int(profile)
+    if _mmgp_enabled and not _MMGP_AVAILABLE:
+        print("[MMGP] 警告: 未检测到 mmgp，开关将被忽略")
+
+
+def _get_mmgp_profile():
+    if not _MMGP_AVAILABLE:
+        return None
+
+    profile_names = {
+        1: "HighRAM_HighVRAM",
+        2: "HighRAM_LowVRAM",
+        3: "LowRAM_HighVRAM",
+        4: "LowRAM_LowVRAM",
+    }
+    preferred = [
+        profile_names.get(int(_mmgp_profile)),
+        "LowRAM_LowVRAM",
+        "HighRAM_LowVRAM",
+        "LowRAM_HighVRAM",
+        "HighRAM_HighVRAM",
+    ]
+    for name in preferred:
+        if name and hasattr(_mmgp_profile_type, name):
+            return getattr(_mmgp_profile_type, name)
+
+    for name in dir(_mmgp_profile_type):
+        if name.startswith("_"):
+            continue
+        return getattr(_mmgp_profile_type, name)
+    return None
+
+
+def _apply_mmgp_to(module, target_name, module_key="model", **override_kwargs):
+    if not _mmgp_enabled:
+        return
+    if not _MMGP_AVAILABLE:
+        return
+    if module is None:
+        return
+
+    key = (target_name, id(module), tuple(sorted(override_kwargs.items())))
+    if key in _mmgp_applied:
+        return
+
+    profile = _get_mmgp_profile()
+    if profile is None:
+        print("[MMGP] 未找到可用 profile，跳过")
+        return
+
+    try:
+        _mmgp_offload.profile(module, profile_no=profile, **override_kwargs)
+    except Exception as e1:
+        try:
+            _mmgp_offload.profile({module_key: module}, profile_no=profile, **override_kwargs)
+        except Exception as e2:
+            print(f"[MMGP] 应用失败 ({target_name}): {e2} (direct={e1})")
+            return
+
+    _mmgp_applied.add(key)
+    try:
+        if hasattr(torch, "set_default_device"):
+            torch.set_default_device("cpu")
+    except Exception:
+        pass
+    if override_kwargs:
+        print(f"[MMGP] 已应用到 {target_name} (profile={_mmgp_profile}, overrides={override_kwargs})")
+    else:
+        print(f"[MMGP] 已应用到 {target_name} (profile={_mmgp_profile})")
+
+
+def _apply_mmgp_to_video_predictor(predictor, version):
+    if not _mmgp_enabled:
+        return
+    model = getattr(predictor, "model", None)
+    if model is None:
+        return
+
+    # 在 mmgp 卸载参数前，强制触发 _device 缓存为 CUDA
+    for _obj in [model, getattr(model, "detector", None)]:
+        if _obj is not None:
+            try:
+                if isinstance(getattr(type(_obj), "device", None), property):
+                    _cached = _obj.device
+                    if _cached is not None and str(_cached) != "cpu":
+                        _obj._device = _cached
+            except Exception:
+                pass
+
+    # 1. 挂载 detector.backbone（vision_backbone + language_backbone）
+    _detector = getattr(model, "detector", None)
+    _bb = getattr(_detector, "backbone", None) if _detector is not None else None
+    if _bb is not None:
+        _apply_mmgp_to(
+            _bb,
+            f"video.{version}.detector.backbone",
+            module_key="transformer",
+            quantizeTransformer=False,
+            asyncTransfers=False,
+        )
+
+    # 2. 挂载 tracker
+    tracker = getattr(model, "tracker", None)
+    if tracker is not None:
+        _apply_mmgp_to(
+            tracker,
+            f"video.{version}.tracker",
+            module_key="transformer",
+            quantizeTransformer=False,
+            asyncTransfers=False,
+        )
+
+
 def get_image_processor(version="sam3"):
     global _image_processor
     if _image_processor is None:
@@ -122,6 +251,7 @@ def get_image_processor(version="sam3"):
                 bpe_path=BPE_PATH,
                 checkpoint_path=ckpt,
             )
+            _apply_mmgp_to(model, f"image.{version}.model", quantizeTransformer=False, asyncTransfers=False)
             _image_processor = Sam3Processor(model, confidence_threshold=0.5)
             print(f"[SAM3] 图像分割模型 ({version}) 加载完成 ✓")
         except Exception as e:
@@ -153,6 +283,7 @@ def get_video_predictor(version="sam3", use_fa3=True):
                 bpe_path=BPE_PATH,
                 use_fa3=use_fa3,
             )
+            _apply_mmgp_to_video_predictor(_video_predictors[version], version)
             print(f"[SAM3] 视频跟踪模型 ({version}, {fa_label}) 加载完成 ✓")
         except Exception as e:
             print(f"[SAM3] ✗ 视频模型 ({version}) 加载失败: {e}")
@@ -174,6 +305,7 @@ def get_interactive_model(version="sam3"):
                 checkpoint_path=ckpt,
                 enable_inst_interactivity=True,
             )
+            _apply_mmgp_to(_interactive_model, f"interactive.{version}.model", quantizeTransformer=False, asyncTransfers=False)
             _interactive_processor = Sam3Processor(_interactive_model)
             print(f"[SAM3] 交互式分割模型 ({version}) 加载完成 ✓")
         except Exception as e:
@@ -349,7 +481,7 @@ def draw_boxes_on_image(image_np, boxes_data):
 # Tab 1 — 图像文本分割
 # ============================================================
 
-def segment_image(image, text_prompt, confidence, mask_mode=False, model_version="sam3"):
+def segment_image(image, text_prompt, confidence, mask_mode=False, model_version="sam3", use_mmgp=False, mmgp_profile=4):
     print(f"\n[SAM3] === 图像分割请求: prompt='{text_prompt}', conf={confidence}, mask={mask_mode}, ver={model_version} ===")
     if image is None:
         gr.Warning("请先上传图片")
@@ -358,6 +490,7 @@ def segment_image(image, text_prompt, confidence, mask_mode=False, model_version
         gr.Warning("请输入文本提示")
         return None, "⚠ 请输入文本提示"
 
+    _set_mmgp_config(use_mmgp, mmgp_profile)
     _ensure_mode(f"image_{model_version}")
     try:
         processor = get_image_processor(model_version)
@@ -406,7 +539,7 @@ def segment_image(image, text_prompt, confidence, mask_mode=False, model_version
 # Tab 2 — 图像框选分割 (Box Prompt)
 # ============================================================
 
-def segment_image_with_boxes(original_image, boxes_data, text_prompt, confidence, mask_mode=False, model_version="sam3"):
+def segment_image_with_boxes(original_image, boxes_data, text_prompt, confidence, mask_mode=False, model_version="sam3", use_mmgp=False, mmgp_profile=4):
     """使用框选提示进行图像分割，可选结合文本提示"""
     text_prompt = (text_prompt or "").strip()
     print(f"\n[SAM3] === 框选分割请求: {len(boxes_data) if boxes_data else 0} 个框, text='{text_prompt}', mask={mask_mode}, ver={model_version} ===")
@@ -417,6 +550,7 @@ def segment_image_with_boxes(original_image, boxes_data, text_prompt, confidence
         gr.Warning("请先画框标记目标区域")
         return None, "⚠ 请先画框标记目标区域"
 
+    _set_mmgp_config(use_mmgp, mmgp_profile)
     _ensure_mode(f"image_{model_version}")
     try:
         processor = get_image_processor(model_version)
@@ -713,7 +847,7 @@ def _tracker_propagate_and_render(tracker, inference_state, frames, fps,
 
 
 def track_video_text(video_path, text_prompt, model_version, mask_mode=False,
-                     use_fa3=True, progress=gr.Progress()):
+                     use_fa3=True, use_mmgp=False, mmgp_profile=4, progress=gr.Progress()):
     """使用文本提示跟踪视频中的对象"""
     print(f"\n[SAM3] === 视频文本跟踪: prompt='{text_prompt}', model={model_version}, mask={mask_mode}, fa={use_fa3} ===")
     if video_path is None:
@@ -723,6 +857,7 @@ def track_video_text(video_path, text_prompt, model_version, mask_mode=False,
         gr.Warning("请输入文本提示")
         return None, "⚠ 请输入文本提示"
 
+    _set_mmgp_config(use_mmgp, mmgp_profile)
     _ensure_mode(f"video_{model_version}")
     try:
         predictor = get_video_predictor(model_version, use_fa3=use_fa3)
@@ -828,7 +963,8 @@ def confirm_frame_selection(preview_img, frame_idx):
 
 
 def track_video_points(video_path, points, model_version, mask_mode=False,
-                       use_fa3=True, start_frame_idx=0, progress=gr.Progress()):
+                       use_fa3=True, use_mmgp=False, mmgp_profile=4,
+                       start_frame_idx=0, progress=gr.Progress()):
     """使用点击提示跟踪视频（底层 tracker API）"""
     start_frame_idx = int(start_frame_idx)
     print(f"\n[SAM3] === 视频点击跟踪: {len(points) if points else 0} 点, model={model_version}, mask={mask_mode}, fa={use_fa3}, start_frame={start_frame_idx} ===")
@@ -837,6 +973,7 @@ def track_video_points(video_path, points, model_version, mask_mode=False,
     if not points:
         return None, "⚠ 请先在首帧上标记至少一个点"
 
+    _set_mmgp_config(use_mmgp, mmgp_profile)
     _ensure_mode(f"video_{model_version}")
     try:
         tracker = _get_tracker(model_version, use_fa3=use_fa3)
@@ -902,7 +1039,8 @@ def track_video_points(video_path, points, model_version, mask_mode=False,
 
 
 def track_video_box(video_path, vid_box_data, model_version, mask_mode=False,
-                    text_prompt="", use_fa3=True, start_frame_idx=0, progress=gr.Progress()):
+                    text_prompt="", use_fa3=True, use_mmgp=False, mmgp_profile=4,
+                    start_frame_idx=0, progress=gr.Progress()):
     """使用框选提示跟踪视频。有文本时走高层 API（文本+框联合），无文本时走底层 tracker API（纯框分割）"""
     start_frame_idx = int(start_frame_idx)
     if video_path is None:
@@ -914,6 +1052,7 @@ def track_video_box(video_path, vid_box_data, model_version, mask_mode=False,
     print(f"\n[SAM3] === 视频框选跟踪: box=({box_x1},{box_y1},{box_x2},{box_y2}), "
           f"text='{text_prompt}', model={model_version}, mask={mask_mode} ===")
 
+    _set_mmgp_config(use_mmgp, mmgp_profile)
     _ensure_mode(f"video_{model_version}")
 
     if text_prompt:
@@ -1120,7 +1259,7 @@ def clear_points(original_image):
     return original_image.copy(), [], "✅ 已清除所有标记点"
 
 
-def segment_with_points(original_image, points, mask_mode=False, model_version="sam3"):
+def segment_with_points(original_image, points, mask_mode=False, model_version="sam3", use_mmgp=False, mmgp_profile=4):
     pos = sum(1 for _, _, l in points if l == 1) if points else 0
     neg = sum(1 for _, _, l in points if l == 0) if points else 0
     print(f"\n[SAM3] === 点击分割请求: {len(points) if points else 0} 个点 (正:{pos}, 负:{neg}), mask={mask_mode}, ver={model_version} ===")
@@ -1131,6 +1270,7 @@ def segment_with_points(original_image, points, mask_mode=False, model_version="
         gr.Warning("请先点击图片标记至少一个点")
         return None, "⚠ 请先标记至少一个点"
 
+    _set_mmgp_config(use_mmgp, mmgp_profile)
     _ensure_mode(f"interactive_{model_version}")
     try:
         model, processor = get_interactive_model(model_version)
@@ -1232,12 +1372,14 @@ def _extract_frames_from_video(video_path, max_frames=0):
 
 
 def batch_segment(source_mode, folder_path, video_file, text_prompt, confidence,
-                  frame_interval, mask_mode=False, model_version="sam3", progress=gr.Progress()):
+                  frame_interval, mask_mode=False, model_version="sam3",
+                  use_mmgp=False, mmgp_profile=4, progress=gr.Progress()):
     """批量图像分割：支持文件夹模式和视频拆帧模式"""
     print(f"\n[SAM3] === 批量分割: mode={source_mode}, prompt='{text_prompt}', conf={confidence}, mask={mask_mode}, ver={model_version} ===")
     if not text_prompt or not text_prompt.strip():
         return [], None, "⚠ 请输入文本提示"
 
+    _set_mmgp_config(use_mmgp, mmgp_profile)
     _ensure_mode(f"image_{model_version}")
 
     # 收集图像
@@ -1387,6 +1529,14 @@ def build_ui():
                 label="⚗ Flash Attention（视频处理加速，需 flash_attn 库）",
                 value=True,
             )
+            global_mmgp = gr.Checkbox(
+                label="🧠 启用 mmgp（显存卸载）",
+                value=False,
+            )
+            global_mmgp_profile = gr.Slider(
+                1, 4, value=4, step=1,
+                label="mmgp profile",
+            )
 
         # ============================================================
         # 大选项卡 A：图片处理
@@ -1419,7 +1569,8 @@ def build_ui():
 
                     img_btn.click(
                         segment_image,
-                        inputs=[img_input, img_text, img_conf, img_mask_mode, global_model],
+                        inputs=[img_input, img_text, img_conf, img_mask_mode, global_model,
+                                global_mmgp, global_mmgp_profile],
                         outputs=[img_output, img_status],
                         concurrency_limit=1,
                     )
@@ -1480,7 +1631,8 @@ def build_ui():
                     box_seg_btn.click(
                         segment_image_with_boxes,
                         inputs=[box_original_state, box_data_state, box_text,
-                                box_conf, box_mask_mode, global_model],
+                                box_conf, box_mask_mode, global_model,
+                                global_mmgp, global_mmgp_profile],
                         outputs=[box_output, box_status],
                         concurrency_limit=1,
                     )
@@ -1524,7 +1676,8 @@ def build_ui():
                     )
                     click_seg_btn.click(
                         segment_with_points,
-                        inputs=[original_image_state, points_state, click_mask_mode, global_model],
+                        inputs=[original_image_state, points_state, click_mask_mode, global_model,
+                                global_mmgp, global_mmgp_profile],
                         outputs=[click_output, click_status],
                         concurrency_limit=1,
                     )
@@ -1595,7 +1748,8 @@ def build_ui():
                         batch_segment,
                         inputs=[batch_source_mode, batch_folder, batch_video,
                                 batch_text, batch_conf, batch_frame_interval,
-                                batch_mask_mode, global_model],
+                                batch_mask_mode, global_model,
+                                global_mmgp, global_mmgp_profile],
                         outputs=[batch_gallery, batch_result_video, batch_status],
                         concurrency_limit=1,
                     )
@@ -1631,7 +1785,8 @@ def build_ui():
                     vid_text_btn.click(
                         track_video_text,
                         inputs=[vid_text_input, vid_text_prompt,
-                                global_model, vid_text_mask, global_fa],
+                                global_model, vid_text_mask, global_fa,
+                                global_mmgp, global_mmgp_profile],
                         outputs=[vid_text_output, vid_text_status],
                         concurrency_limit=1,
                     )
@@ -1729,6 +1884,7 @@ def build_ui():
                         track_video_points,
                         inputs=[vid_pt_video, vid_pt_points,
                                 global_model, vid_pt_mask, global_fa,
+                                global_mmgp, global_mmgp_profile,
                                 vid_pt_frame_idx],
                         outputs=[vid_pt_output, vid_pt_status],
                         concurrency_limit=1,
@@ -1830,6 +1986,7 @@ def build_ui():
                         track_video_box,
                         inputs=[vid_box_video, vid_box_data,
                                 global_model, vid_box_mask, vid_box_text, global_fa,
+                                global_mmgp, global_mmgp_profile,
                                 vid_box_frame_idx],
                         outputs=[vid_box_output, vid_box_status],
                         concurrency_limit=1,

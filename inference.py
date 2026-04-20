@@ -51,6 +51,16 @@ import numpy as np
 import torch
 from PIL import Image
 
+try:
+    from mmgp import offload as _mmgp_offload
+    from mmgp import profile_type as _mmgp_profile_type
+
+    _MMGP_AVAILABLE = True
+except Exception:
+    _mmgp_offload = None
+    _mmgp_profile_type = None
+    _MMGP_AVAILABLE = False
+
 # ---------------------------------------------------------------------------
 # 路径
 # ---------------------------------------------------------------------------
@@ -271,6 +281,8 @@ class SAM3Inference:
         use_fa: bool = True,
         confidence: float = 0.5,
         mask_mode: bool = False,
+        use_mmgp: bool = False,
+        mmgp_profile: int = 4,
         output_dir: str = OUTPUT_DIR,
         checkpoint_sam3: str = CHECKPOINT_SAM3,
         checkpoint_sam31: str = CHECKPOINT_SAM31,
@@ -291,6 +303,8 @@ class SAM3Inference:
         self.use_fa = use_fa
         self.confidence = confidence
         self.mask_mode = mask_mode
+        self.use_mmgp = use_mmgp
+        self.mmgp_profile = int(mmgp_profile)
         self.output_dir = output_dir
         self.checkpoint_sam3 = checkpoint_sam3
         self.checkpoint_sam31 = checkpoint_sam31
@@ -302,6 +316,10 @@ class SAM3Inference:
         self._video_predictor = None
         self._video_predictor_fa = None  # 记录构建时的 FA 设置
         self._active_mode = None  # "image" / "interactive" / "video"
+        self._mmgp_applied = set()
+
+        if self.use_mmgp and not _MMGP_AVAILABLE:
+            print("[MMGP] 警告: 未检测到 mmgp，已忽略 --mmgp 参数")
 
     @property
     def _ckpt(self) -> str:
@@ -354,8 +372,9 @@ class SAM3Inference:
             model = build_sam3_image_model(
                 bpe_path=self.bpe_path, checkpoint_path=self._ckpt,
             )
+            self._apply_mmgp(model, "image.model")
             self._image_processor = Sam3Processor(model, confidence_threshold=self.confidence)
-            print(f"[SAM3] 图像分割模型加载完成 ✓")
+            print("[SAM3] 图像分割模型加载完成 [OK]")
         self._image_processor.confidence_threshold = self.confidence
         return self._image_processor
 
@@ -368,8 +387,9 @@ class SAM3Inference:
                 bpe_path=self.bpe_path, checkpoint_path=self._ckpt,
                 enable_inst_interactivity=True,
             )
+            self._apply_mmgp(self._interactive_model, "interactive.model")
             self._interactive_processor = Sam3Processor(self._interactive_model)
-            print(f"[SAM3] 交互式分割模型加载完成 ✓")
+            print("[SAM3] 交互式分割模型加载完成 [OK]")
         return self._interactive_model, self._interactive_processor
 
     def _get_video_predictor(self):
@@ -387,8 +407,9 @@ class SAM3Inference:
                 bpe_path=self.bpe_path,
                 use_fa3=self.use_fa,
             )
+            self._try_apply_mmgp_to_video_predictor(self._video_predictor)
             self._video_predictor_fa = self.use_fa
-            print(f"[SAM3] 视频模型加载完成 ✓")
+            print("[SAM3] 视频模型加载完成 [OK]")
         return self._video_predictor
 
     def _get_tracker(self):
@@ -398,6 +419,117 @@ class SAM3Inference:
         if hasattr(model, "detector") and hasattr(model.detector, "backbone"):
             tracker.backbone = model.detector.backbone
         return tracker
+
+    def _get_mmgp_profile(self):
+        if not _MMGP_AVAILABLE:
+            return None
+
+        profile_names = {
+            1: "HighRAM_HighVRAM",
+            2: "HighRAM_LowVRAM",
+            3: "LowRAM_HighVRAM",
+            4: "LowRAM_LowVRAM",
+        }
+
+        preferred = [
+            profile_names.get(int(self.mmgp_profile)),
+            "LowRAM_LowVRAM",
+            "HighRAM_LowVRAM",
+            "LowRAM_HighVRAM",
+            "HighRAM_HighVRAM",
+        ]
+        for name in preferred:
+            if name and hasattr(_mmgp_profile_type, name):
+                return getattr(_mmgp_profile_type, name)
+
+        for name in dir(_mmgp_profile_type):
+            if name.startswith("_"):
+                continue
+            return getattr(_mmgp_profile_type, name)
+        return None
+
+    def _apply_mmgp(self, module, target_name: str, module_key: str = "model", **override_kwargs):
+        if not self.use_mmgp:
+            return
+        if not _MMGP_AVAILABLE:
+            return
+        if module is None:
+            return
+
+        key = (target_name, id(module), tuple(sorted(override_kwargs.items())))
+        if key in self._mmgp_applied:
+            return
+
+        profile = self._get_mmgp_profile()
+        if profile is None:
+            print("[MMGP] 未找到可用 profile，跳过")
+            return
+
+        try:
+            _mmgp_offload.profile(module, profile_no=profile, **override_kwargs)
+        except Exception as e1:
+            try:
+                _mmgp_offload.profile({module_key: module}, profile_no=profile, **override_kwargs)
+            except Exception as e2:
+                print(f"[MMGP] 应用失败 ({target_name}): {e2} (direct={e1})")
+                return
+
+        self._mmgp_applied.add(key)
+        try:
+            if hasattr(torch, "set_default_device"):
+                torch.set_default_device("cpu")
+        except Exception:
+            pass
+        if override_kwargs:
+            print(f"[MMGP] 已应用到 {target_name} (profile={self.mmgp_profile}, overrides={override_kwargs})")
+        else:
+            print(f"[MMGP] 已应用到 {target_name} (profile={self.mmgp_profile})")
+
+    def _try_apply_mmgp_to_video_predictor(self, predictor):
+        if not self.use_mmgp:
+            return
+        model = getattr(predictor, "model", None)
+        if model is None:
+            return
+
+        # 在 mmgp 卸载参数前，强制触发 _device 缓存为 CUDA。
+        # sam3_video_base.py 的 device 属性会 lazy 地缓存 next(parameters()).device；
+        # 卸载后第一次取值若不缓存，会拿到 CPU param 的 device，导致 image 被移到 CPU。
+        for _obj in [model, getattr(model, "detector", None)]:
+            if _obj is not None:
+                try:
+                    # hasattr(type, "device") 比 callable(property) 更可靠
+                    if isinstance(getattr(type(_obj), "device", None), property):
+                        _cached = _obj.device
+                        if _cached is not None and str(_cached) != "cpu":
+                            _obj._device = _cached
+                except Exception:
+                    pass
+
+        # 1. 挂载 detector.backbone（vision_backbone ~1.76GB + language_backbone ~1.35GB）
+        #    text_encoder_ve.py 中已修复 token_embedding 设备错配问题，因此可安全卸载。
+        _detector = getattr(model, "detector", None)
+        _bb = getattr(_detector, "backbone", None) if _detector is not None else None
+        if _bb is not None:
+            self._apply_mmgp(
+                _bb,
+                "video.detector.backbone",
+                module_key="transformer",
+                quantizeTransformer=False,
+                asyncTransfers=False,
+            )
+
+        # 2. 挂载 tracker（~45MB）
+        tracker = getattr(model, "tracker", None)
+        if tracker is not None:
+            self._apply_mmgp(
+                tracker,
+                "video.tracker",
+                module_key="transformer",
+                quantizeTransformer=False,
+                asyncTransfers=False,
+            )
+
 
     # ==================================================================
     # 图片 — 文本分割
@@ -1169,7 +1301,7 @@ def _progress_printer(stage, current, total):
     bar_len = 30
     pct = current / max(total, 1)
     filled = int(bar_len * pct)
-    bar = "█" * filled + "░" * (bar_len - filled)
+    bar = "#" * filled + "-" * (bar_len - filled)
     print(f"\r  [{bar}] {stage}: {current}/{total}", end="", flush=True)
     if current >= total:
         print()
@@ -1179,7 +1311,7 @@ def _batch_progress(current, total, name):
     bar_len = 30
     pct = (current + 1) / max(total, 1)
     filled = int(bar_len * pct)
-    bar = "█" * filled + "░" * (bar_len - filled)
+    bar = "#" * filled + "-" * (bar_len - filled)
     print(f"\r  [{bar}] {current+1}/{total} {name}", end="", flush=True)
     if current + 1 >= total:
         print()
@@ -1227,6 +1359,8 @@ def main():
     common.add_argument("--model", default="sam3", choices=["sam3", "sam3.1"], help="模型版本")
     common.add_argument("--mask", action="store_true", help="输出二值 mask 而非叠加可视化")
     common.add_argument("--no-fa", action="store_true", help="禁用 Flash Attention")
+    common.add_argument("--mmgp", action="store_true", help="启用 mmgp 显存卸载")
+    common.add_argument("--mmgp-profile", type=int, default=4, help="mmgp profile（默认 4）")
     common.add_argument("-o", "--output", help="输出路径")
 
     # image-text
@@ -1284,6 +1418,8 @@ def main():
         version=args.model,
         use_fa=not args.no_fa,
         mask_mode=args.mask,
+        use_mmgp=args.mmgp,
+        mmgp_profile=args.mmgp_profile,
     )
 
     try:

@@ -58,6 +58,10 @@ httpx>=0.28
 websockets>=15.0
 rich>=15.0
 
+# ---------- mmgp 显存优化（适合 12GB 及以下显卡，可选） ----------
+mmgp>=3.7.6
+# accelerate 和 optimum-quanto 由 mmgp 自动依赖，无需手动安装
+
 # ---------- 其他工具 ----------
 pillow>=11.3
 PyYAML>=6.0
