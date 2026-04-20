@@ -59,10 +59,20 @@ conda create -p SAM3easyuse_env python=3.12 -y
 ### 3. 安装 PyTorch（CUDA 12.8）
 
 ```bash
-SAM3easyuse_env\python.exe -m pip install torch==2.9.0+cu128 torchvision==0.24.0+cu128 torchaudio==2.9.0+cu128 --index-url https://download.pytorch.org/whl/cu128
+SAM3easyuse_env\python.exe -m pip install torch==2.9.0 torchvision==0.24.0 --index-url https://download.pytorch.org/whl/cu128
 ```
 
-### 4. 安装 Flash Attention 2
+### 4. 安装 Triton
+
+```bash
+# Windows
+SAM3easyuse_env\python.exe -m pip install triton-windows
+
+# Linux
+SAM3easyuse_env/bin/python -m pip install triton
+```
+
+### 5. 安装 Flash Attention 2
 
 从 [Release](https://github.com/RakuhaSociety/SAM3easyuse/releases) 下载预编译 whl：
 
@@ -72,13 +82,13 @@ SAM3easyuse_env\python.exe -m pip install flash_attn-2.8.3+cu128torch2.9.0cxx11a
 
 > 如果你的环境不匹配此 whl，可以在 Gradio UI / CLI 中关闭 Flash Attention（`--no-fa`），程序会回退到 SDPA。
 
-### 5. 安装其余依赖
+### 6. 安装其余依赖
 
 ```bash
 SAM3easyuse_env\python.exe -m pip install -r requirements.txt
 ```
 
-### 6. 安装 SAM3
+### 7. 安装 SAM3
 
 ```bash
 cd sam3
@@ -86,14 +96,14 @@ cd sam3
 cd ..
 ```
 
-### 7. 下载模型权重
+### 8. 下载模型权重
 
 将以下文件放入 `sam3/checkpoints/` 目录：
 
 - `sam3.pt` — SAM3 模型
 - `sam3.1_multiplex.pt` — SAM3.1 模型
 
-### 8. FFmpeg
+### 9. FFmpeg
 
 将 FFmpeg 解压到项目根目录（或确保 `ffmpeg` 在系统 PATH 中）。
 
