@@ -12,8 +12,14 @@ SAM3mmgp_env/
 SAM3tools_env/
 *.env/
 .venv/
+pyproject.toml
+uv.lock
+.python-version
+whl_package
+
 
 # ===== 模型权重 (太大, 放 Release 或自行下载) =====
+sam3/checkpoints
 sam3/checkpoints/*.pt
 sam3/checkpoints/*.pth
 sam3/checkpoints/*.bin
@@ -45,3 +51,8 @@ Desktop.ini
 
 # ===== 日志 =====
 *.log
+error_log.md
+TODO.md
+
+# ===== test data set =====
+assets
