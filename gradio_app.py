@@ -196,12 +196,18 @@ def _apply_mmgp_to(module, target_name, module_key="model", **override_kwargs):
         print(f"[MMGP] 已应用到 {target_name} (profile={_mmgp_profile})")
 
 
-def _apply_mmgp_to_video_predictor(predictor, version):
+def _apply_mmgp_to_video_predictor(predictor, version, sam31_batch_size=1):
     if not _mmgp_enabled:
         return
     model = getattr(predictor, "model", None)
     if model is None:
         return
+
+    def _param_mb(mod):
+        try:
+            return sum(p.numel() * p.element_size() for p in mod.parameters()) / 1024**2
+        except Exception:
+            return 0.0
 
     # 在 mmgp 卸载参数前，强制触发 _device 缓存为 CUDA
     for _obj in [model, getattr(model, "detector", None)]:
@@ -218,6 +224,8 @@ def _apply_mmgp_to_video_predictor(predictor, version):
     _detector = getattr(model, "detector", None)
     _bb = getattr(_detector, "backbone", None) if _detector is not None else None
     if _bb is not None:
+        _bb_mb = _param_mb(_bb)
+        print(f"[MMGP] 准备卸载 detector.backbone ({_bb_mb:.0f} MB) 到 RAM ...")
         _apply_mmgp_to(
             _bb,
             f"video.{version}.detector.backbone",
@@ -229,6 +237,8 @@ def _apply_mmgp_to_video_predictor(predictor, version):
     # 2. 挂载 tracker
     tracker = getattr(model, "tracker", None)
     if tracker is not None:
+        _trk_mb = _param_mb(tracker)
+        print(f"[MMGP] 准备卸载 tracker ({_trk_mb:.0f} MB) 到 RAM ...")
         _apply_mmgp_to(
             tracker,
             f"video.{version}.tracker",
@@ -236,6 +246,37 @@ def _apply_mmgp_to_video_predictor(predictor, version):
             quantizeTransformer=False,
             asyncTransfers=False,
         )
+
+    # 3. SAM3.1 专项：把 tracker 推理状态按帧卸载到 CPU RAM
+    #    原因：SAM3.1 tracker 默认把每帧的 maskmem_features、pred_masks、
+    #    image_features 全部留在 GPU（offload_output_to_cpu_for_eval=False）。
+    #    随着视频帧数增加，这些中间张量会持续积累，导致显存拉满。
+    #    代码已预留 .cpu()/.cuda() 的完整 offload 流程，只需打开此开关即可。
+    if version == "sam3.1":
+        # tracker = Sam3MultiplexPredictorWrapper → .model = Sam3VideoTrackingMultiplexDemo
+        _inner = getattr(tracker, "model", None) if tracker is not None else None
+        if _inner is not None and hasattr(_inner, "offload_output_to_cpu_for_eval"):
+            _inner.offload_output_to_cpu_for_eval = True
+            print("[MMGP] SAM3.1 tracker: 已启用 offload_output_to_cpu_for_eval=True（推理状态按帧卸载到 CPU RAM）")
+        # 同步设置 fill_hole_area=0 下的 non-cond 帧裁剪，进一步限制显存积累
+        if _inner is not None and hasattr(_inner, "trim_past_non_cond_mem_for_eval"):
+            _inner.trim_past_non_cond_mem_for_eval = True
+            print("[MMGP] SAM3.1 tracker: 已启用 trim_past_non_cond_mem_for_eval=True（裁剪旧非条件帧记忆）")
+
+    # 4. SAM3.1 专项：控制批量 grounding 大小以平衡显存与速度
+    #    batched_grounding_batch_size=16（默认）: backbone 一次处理 16 帧，速度快但激活内存 ×16（~1.5 GB）
+    #    batched_grounding_batch_size=1（mmgp 建议）: 逐帧处理，显存降至与 SAM3 相当
+    if version == "sam3.1" and model is not None:
+        _eff_batch = int(sam31_batch_size)
+        _use_batched = _eff_batch > 1
+        if hasattr(model, "use_batched_grounding"):
+            model.use_batched_grounding = _use_batched
+            print(f"[MMGP] SAM3.1: use_batched_grounding={_use_batched}（batch={_eff_batch}）")
+        if hasattr(model, "batched_grounding_batch_size"):
+            model.batched_grounding_batch_size = _eff_batch
+        if hasattr(model, "postprocess_batch_size"):
+            model.postprocess_batch_size = _eff_batch
+            print(f"[MMGP] SAM3.1: postprocess_batch_size={_eff_batch}")
 
 
 def get_image_processor(version="sam3"):
@@ -1585,10 +1626,10 @@ def load_image_model(model_version, use_mmgp, mmgp_profile):
         return err, ""
 
 
-def load_video_model(model_version, use_fa3, use_mmgp, mmgp_profile):
+def load_video_model(model_version, use_fa3, use_mmgp, mmgp_profile, sam31_batch_size=16):
     """显式加载/重载视频模型。强制卸载旧模型使 mmgp 设置立即生效。"""
     global _image_processor, _interactive_model, _interactive_processor, _video_predictors, _video_use_fa, _active_mode
-    print(f"\n[SAM3] === 显式加载视频模型: ver={model_version}, fa={use_fa3}, mmgp={use_mmgp}, profile={mmgp_profile} ===")
+    print(f"\n[SAM3] === 显式加载视频模型: ver={model_version}, fa={use_fa3}, mmgp={use_mmgp}, profile={mmgp_profile}, sam31_batch={sam31_batch_size} ===")
     # 强制卸载所有已缓存的视频预测器
     for ver in list(_video_predictors.keys()):
         print(f"[SAM3] 卸载旧视频模型 ({ver})...")
@@ -1611,9 +1652,24 @@ def load_video_model(model_version, use_fa3, use_mmgp, mmgp_profile):
     _set_mmgp_config(use_mmgp, mmgp_profile)
     try:
         _ensure_mode(f"video_{model_version}")
-        get_video_predictor(model_version, use_fa3)
+        predictor = get_video_predictor(model_version, use_fa3)
+        # 加载完成后应用 batch 参数（mmgp 路径已在 get_video_predictor 内调用过
+        # _apply_mmgp_to_video_predictor，这里再次覆盖以应用 UI 设置的 batch_size）
+        if use_mmgp and _mmgp_enabled and predictor is not None and model_version == "sam3.1":
+            _m = getattr(predictor, "model", None)
+            if _m is not None:
+                _eff = int(sam31_batch_size)
+                _use_batched = _eff > 1
+                if hasattr(_m, "use_batched_grounding"):
+                    _m.use_batched_grounding = _use_batched
+                if hasattr(_m, "batched_grounding_batch_size"):
+                    _m.batched_grounding_batch_size = _eff
+                if hasattr(_m, "postprocess_batch_size"):
+                    _m.postprocess_batch_size = _eff
+                print(f"[SAM3] SAM3.1 batched_grounding_batch_size 已设为 {_eff}")
         fa_note = "FA2" if use_fa3 else "SDPA"
-        mmgp_note = f"（mmgp profile={mmgp_profile}）" if use_mmgp else "（未启用 mmgp）"
+        batch_note = f"batch={int(sam31_batch_size)}" if model_version == "sam3.1" else ""
+        mmgp_note = f"（mmgp profile={mmgp_profile}{', ' + batch_note if batch_note else ''}）" if use_mmgp else "（未启用 mmgp）"
         vid_status = f"✅ 视频模型 ({model_version}, {fa_note}) 加载完成 {mmgp_note}"
         img_status = "⚠ 图像模型已卸载（加载视频模型时释放显存）——如需图像推理请重新加载"
         return img_status, vid_status
@@ -1651,6 +1707,15 @@ def build_ui():
             global_mmgp_profile = gr.Slider(
                 1, 4, value=4, step=1,
                 label="mmgp profile",
+            )
+            sam31_batch_md = gr.Markdown(
+                "**SAM3.1 backbone 批大小**  \nbatch=16 快但显存高；（1:约7GB, 4:约9GB, 16:约12GB）",
+                visible=False,
+            )
+            sam31_batch_size = gr.Number(
+                value=4,
+                label="批大小",
+                visible=False,
             )
 
         # ============================================================
@@ -1891,7 +1956,7 @@ def build_ui():
                 )
             vid_load_btn.click(
                 load_video_model,
-                inputs=[global_model, global_fa, global_mmgp, global_mmgp_profile],
+                inputs=[global_model, global_fa, global_mmgp, global_mmgp_profile, sam31_batch_size],
                 outputs=[img_load_status, vid_load_status],
                 concurrency_limit=1,
             )
@@ -2135,6 +2200,23 @@ def build_ui():
             inputs=[global_model, global_mmgp, global_mmgp_profile],
             outputs=[img_load_status, vid_load_status],
             concurrency_limit=1,
+        )
+
+        # SAM3.1 batch_size 联动：模型版本或 mmgp 开关变化时更新可见性和默认值
+        def _update_batch_slider(model_version, use_mmgp):
+            is_31 = model_version == "sam3.1"
+            default_val = 4 if use_mmgp else 1
+            return gr.update(visible=is_31), gr.update(visible=is_31, value=default_val)
+
+        global_model.change(
+            _update_batch_slider,
+            inputs=[global_model, global_mmgp],
+            outputs=[sam31_batch_md, sam31_batch_size],
+        )
+        global_mmgp.change(
+            _update_batch_slider,
+            inputs=[global_model, global_mmgp],
+            outputs=[sam31_batch_md, sam31_batch_size],
         )
 
         gr.Markdown(

@@ -140,6 +140,9 @@ python inference.py video-box -v input.mp4 --box 100,50,400,300 -t "person" -o t
 - `--model sam3.1` — 使用 SAM3.1 模型
 - `--mask` — 输出二值 Mask
 - `--no-fa` — 禁用 Flash Attention
+- `--mmgp` — 启用 mmgp 显存优化
+- `--mmgp-profile N` — mmgp profile，1–5，默认 4
+- `--sam31-batch-size N` — SAM3.1 视频 backbone 批大小（默认 1，mmgp 模式建议 4）
 
 ### 作为 Python 库
 
@@ -161,6 +164,18 @@ path, info = sam.track_video_box("input.mp4", (100, 50, 400, 300), text="person"
 sam.unload_all()  # 释放显存
 ```
 
+启用 mmgp 时（SAM3.1 视频推荐设 `sam31_batch_size=4`）：
+
+```python
+sam = SAM3Inference(
+    version="sam3.1",
+    use_fa=True,
+    use_mmgp=True,
+    mmgp_profile=4,
+    sam31_batch_size=4,   # 批量 grounding，提升视频推理速度
+)
+```
+
 ## 项目结构
 
 ```
@@ -174,27 +189,27 @@ SAM3easyuse/
 └── outputs/             # 推理结果输出目录
 ```
 
-## mmgp 显存优化（12GB 显卡推荐）
+## mmgp 显存优化
 
 [mmgp (Memory Management for the GPU Poor)](https://github.com/deepbeepmeep/mmgp) 可将模型权重分片管理在 RAM 与 VRAM 之间，显著降低峰值显存占用。
 
 ### 安装
 
 ```bash
-uv pip install mmgp
+pip install mmgp
 ```
 
 ### 在 Gradio UI 中启用
 
 启动 Web UI 后，顶部设置栏勾选 **💾 mmgp 显存优化**，并选择合适的 Profile：
 
-| Profile | 适合场景 | RAM 要求 | VRAM 要求 |
-|---------|---------|---------|---------|
-| 1 - HighRAM_HighVRAM | 最快，批量短视频 | ≥ 48 GB | ≥ 24 GB |
-| 2 - HighRAM_LowVRAM | RTX 3080/4080 推荐 | ≥ 48 GB | ≥ 12 GB |
-| 3 - LowRAM_HighVRAM | RAM 有限但 VRAM 充足 | ≥ 32 GB | ≥ 24 GB |
-| **4 - LowRAM_LowVRAM** | **默认，12GB 显卡** | ≥ 32 GB | ≥ 12 GB |
-| 5 - VeryLowRAM_LowVRAM | 最省显存 | ≥ 24 GB | ≥ 10 GB |
+| Profile                      | 适合场景                  | RAM 要求 | VRAM 要求 |
+| ---------------------------- | ------------------------- | -------- | --------- |
+| 1 - HighRAM_HighVRAM         | 最快，批量短视频          | ≥ 48 GB | ≥ 24 GB  |
+| 2 - HighRAM_LowVRAM          | RTX 3080/4080 推荐        | ≥ 48 GB | ≥ 12 GB  |
+| 3 - LowRAM_HighVRAM          | RAM 有限但 VRAM 充足      | ≥ 32 GB | ≥ 24 GB  |
+| **4 - LowRAM_LowVRAM** | **默认，12GB 显卡** | ≥ 32 GB | ≥ 12 GB  |
+| 5 - VeryLowRAM_LowVRAM       | 最省显存                  | ≥ 24 GB | ≥ 10 GB  |
 
 > 启用后下次调用加载模型时自动生效；切换 Profile 后无须重启，下次推理生效。
 
@@ -202,13 +217,13 @@ uv pip install mmgp
 
 ```bash
 # 图像分割 + mmgp profile 4（默认）
-uv run python inference.py image-text -i photo.jpg -t "person" --mmgp
+python inference.py image-text -i photo.jpg -t "person" --mmgp
 
 # 指定 profile 2（HighRAM_LowVRAM，速度更快）
-uv run python inference.py image-text -i photo.jpg -t "person" --mmgp --mmgp-profile 2
+python inference.py image-text -i photo.jpg -t "person" --mmgp --mmgp-profile 2
 
 # 视频跟踪（视频模型 mmgp 为 best-effort 模式，效果取决于模型结构）
-uv run python inference.py video-text -v input.mp4 -t "person" --mmgp
+python inference.py video-text -v input.mp4 -t "person" --mmgp
 ```
 
 ### 作为 Python 库使用
@@ -216,6 +231,7 @@ uv run python inference.py video-text -v input.mp4 -t "person" --mmgp
 ```python
 from inference import SAM3Inference
 
+# 图像推理 + mmgp
 sam = SAM3Inference(
     version="sam3.1",
     use_fa=True,
@@ -223,12 +239,22 @@ sam = SAM3Inference(
     mmgp_profile=4,      # 1-5，默认 4
 )
 result, info = sam.segment_image_text("photo.jpg", "person")
+
+# 视频推理 + mmgp + 批处理加速（SAM3.1）
+sam = SAM3Inference(
+    version="sam3.1",
+    use_fa=True,
+    use_mmgp=True,
+    mmgp_profile=4,
+    sam31_batch_size=4,  # 批量 backbone 推理，提升吞吐
+)
+path, info = sam.track_video_text("input.mp4", "person")
 ```
 
 ### 注意事项
 
 - **图像模型**（文本分割、框选分割、点击分割）完整支持 mmgp
-- **视频模型** mmgp 为 best-effort 模式，若找不到内部模型结构会自动跳过并记录日志
+- **视频模型**支持 mmgp，SAM3 和 SAM3.1 均已验证可用
 - Windows 系统比 Linux 额外需要约 16 GB RAM
 - mmgp 会对 `transformer` 组件进行 8-bit 量化，可能导致精度略有下降
 
