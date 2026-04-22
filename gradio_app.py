@@ -507,6 +507,9 @@ def segment_image(image, text_prompt, confidence, mask_mode=False, model_version
         gr.Warning("请输入文本提示")
         return None, "⚠ 请输入文本提示"
 
+    if _image_processor is None:
+        return None, "⚠ 图像模型未加载，请先点击「加载图像模型」按钮"
+
     _set_mmgp_config(use_mmgp, mmgp_profile)
     _ensure_mode(f"image_{model_version}")
     try:
@@ -566,6 +569,9 @@ def segment_image_with_boxes(original_image, boxes_data, text_prompt, confidence
     if not boxes_data:
         gr.Warning("请先画框标记目标区域")
         return None, "⚠ 请先画框标记目标区域"
+
+    if _image_processor is None:
+        return None, "⚠ 图像模型未加载，请先点击「加载图像模型」按钮"
 
     _set_mmgp_config(use_mmgp, mmgp_profile)
     _ensure_mode(f"image_{model_version}")
@@ -874,6 +880,9 @@ def track_video_text(video_path, text_prompt, model_version, mask_mode=False,
         gr.Warning("请输入文本提示")
         return None, "⚠ 请输入文本提示"
 
+    if model_version not in _video_predictors:
+        return None, "⚠ 视频模型未加载，请先点击「加载视频模型」按钮"
+
     _set_mmgp_config(use_mmgp, mmgp_profile)
     _ensure_mode(f"video_{model_version}")
     try:
@@ -990,6 +999,9 @@ def track_video_points(video_path, points, model_version, mask_mode=False,
     if not points:
         return None, "⚠ 请先在首帧上标记至少一个点"
 
+    if model_version not in _video_predictors:
+        return None, "⚠ 视频模型未加载，请先点击「加载视频模型」按钮"
+
     _set_mmgp_config(use_mmgp, mmgp_profile)
     _ensure_mode(f"video_{model_version}")
     try:
@@ -1068,6 +1080,9 @@ def track_video_box(video_path, vid_box_data, model_version, mask_mode=False,
     text_prompt = (text_prompt or "").strip()
     print(f"\n[SAM3] === 视频框选跟踪: box=({box_x1},{box_y1},{box_x2},{box_y2}), "
           f"text='{text_prompt}', model={model_version}, mask={mask_mode} ===")
+
+    if model_version not in _video_predictors:
+        return None, "⚠ 视频模型未加载，请先点击「加载视频模型」按钮"
 
     _set_mmgp_config(use_mmgp, mmgp_profile)
     _ensure_mode(f"video_{model_version}")
@@ -1287,6 +1302,9 @@ def segment_with_points(original_image, points, mask_mode=False, model_version="
         gr.Warning("请先点击图片标记至少一个点")
         return None, "⚠ 请先标记至少一个点"
 
+    if _interactive_model is None:
+        return None, "⚠ 图像模型未加载，请先点击「加载图像模型」按钮"
+
     _set_mmgp_config(use_mmgp, mmgp_profile)
     _ensure_mode(f"interactive_{model_version}")
     try:
@@ -1395,6 +1413,8 @@ def batch_segment(source_mode, folder_path, video_file, text_prompt, confidence,
     print(f"\n[SAM3] === 批量分割: mode={source_mode}, prompt='{text_prompt}', conf={confidence}, mask={mask_mode}, ver={model_version} ===")
     if not text_prompt or not text_prompt.strip():
         return [], None, "⚠ 请输入文本提示"
+    if _image_processor is None:
+        return [], None, "⚠ 图像模型未加载，请先点击「加载图像模型」按钮"
 
     _set_mmgp_config(use_mmgp, mmgp_profile)
     _ensure_mode(f"image_{model_version}")
@@ -1526,6 +1546,84 @@ def batch_segment(source_mode, folder_path, video_file, text_prompt, confidence,
 
 
 # ============================================================
+# 模型显式加载（供 UI 按钮调用）
+# ============================================================
+
+def load_image_model(model_version, use_mmgp, mmgp_profile):
+    """显式加载/重载图像模型。强制卸载旧模型使 mmgp 设置立即生效。"""
+    global _image_processor, _interactive_model, _interactive_processor, _video_predictors, _active_mode
+    print(f"\n[SAM3] === 显式加载图像模型: ver={model_version}, mmgp={use_mmgp}, profile={mmgp_profile} ===")
+    # 强制卸载旧图像/交互式模型，确保新 mmgp 设置干净生效
+    if _image_processor is not None:
+        print("[SAM3] 卸载旧图像分割模型...")
+        del _image_processor
+        _image_processor = None
+    if _interactive_model is not None:
+        print("[SAM3] 卸载旧交互式分割模型...")
+        del _interactive_model, _interactive_processor
+        _interactive_model = None
+        _interactive_processor = None
+    # 同时卸载视频模型（显存只够一侧）
+    for ver in list(_video_predictors.keys()):
+        print(f"[SAM3] 卸载视频模型 ({ver}) 以释放显存...")
+        del _video_predictors[ver]
+    _video_predictors.clear()
+    _active_mode = None
+    _cleanup_gpu()
+
+    _set_mmgp_config(use_mmgp, mmgp_profile)
+    try:
+        _ensure_mode(f"image_{model_version}")
+        get_image_processor(model_version)
+        mmgp_note = f"（mmgp profile={mmgp_profile}）" if use_mmgp else "（未启用 mmgp）"
+        img_status = f"✅ 图像模型 ({model_version}) 加载完成 {mmgp_note}"
+        vid_status = "⚠ 视频模型已卸载（加载图像模型时释放显存）——如需视频推理请重新加载"
+        return img_status, vid_status
+    except Exception as e:
+        traceback.print_exc()
+        err = f"❌ 图像模型加载失败: {e}"
+        return err, ""
+
+
+def load_video_model(model_version, use_fa3, use_mmgp, mmgp_profile):
+    """显式加载/重载视频模型。强制卸载旧模型使 mmgp 设置立即生效。"""
+    global _image_processor, _interactive_model, _interactive_processor, _video_predictors, _video_use_fa, _active_mode
+    print(f"\n[SAM3] === 显式加载视频模型: ver={model_version}, fa={use_fa3}, mmgp={use_mmgp}, profile={mmgp_profile} ===")
+    # 强制卸载所有已缓存的视频预测器
+    for ver in list(_video_predictors.keys()):
+        print(f"[SAM3] 卸载旧视频模型 ({ver})...")
+        del _video_predictors[ver]
+    _video_predictors.clear()
+    _video_use_fa = use_fa3
+    # 同时卸载图像/交互式模型（显存只够一侧）
+    if _image_processor is not None:
+        print("[SAM3] 卸载图像分割模型以释放显存...")
+        del _image_processor
+        _image_processor = None
+    if _interactive_model is not None:
+        print("[SAM3] 卸载交互式分割模型以释放显存...")
+        del _interactive_model, _interactive_processor
+        _interactive_model = None
+        _interactive_processor = None
+    _active_mode = None
+    _cleanup_gpu()
+
+    _set_mmgp_config(use_mmgp, mmgp_profile)
+    try:
+        _ensure_mode(f"video_{model_version}")
+        get_video_predictor(model_version, use_fa3)
+        fa_note = "FA2" if use_fa3 else "SDPA"
+        mmgp_note = f"（mmgp profile={mmgp_profile}）" if use_mmgp else "（未启用 mmgp）"
+        vid_status = f"✅ 视频模型 ({model_version}, {fa_note}) 加载完成 {mmgp_note}"
+        img_status = "⚠ 图像模型已卸载（加载视频模型时释放显存）——如需图像推理请重新加载"
+        return img_status, vid_status
+    except Exception as e:
+        traceback.print_exc()
+        err = f"❌ 视频模型加载失败: {e}"
+        return "", err
+
+
+# ============================================================
 # Gradio UI
 # ============================================================
 
@@ -1539,7 +1637,7 @@ def build_ui():
         # ============ 顶部：全局模型选择 ============
         with gr.Row():
             global_model = gr.Radio(
-                ["sam3", "sam3.1"], value="sam3.1",
+                ["sam3", "sam3.1"], value="sam3",
                 label="模型版本（SAM3.1 使用 Object Multiplex，多对象更快）",
             )
             global_fa = gr.Checkbox(
@@ -1559,6 +1657,14 @@ def build_ui():
         # 大选项卡 A：图片处理
         # ============================================================
         with gr.Tab("🖼️ 图片处理"):
+            with gr.Row():
+                img_load_btn = gr.Button("📥 加载图像模型", variant="secondary", scale=1)
+                img_load_status = gr.Textbox(
+                    label="模型状态",
+                    placeholder="点击「加载图像模型」以载入/重载模型（切换 mmgp 后须重新加载）",
+                    interactive=False,
+                    scale=4,
+                )
             with gr.Tabs():
 
                 # ---------- 文本分割 ----------
@@ -1775,6 +1881,20 @@ def build_ui():
         # 大选项卡 B：视频处理
         # ============================================================
         with gr.Tab("🎬 视频处理"):
+            with gr.Row():
+                vid_load_btn = gr.Button("📥 加载视频模型", variant="secondary", scale=1)
+                vid_load_status = gr.Textbox(
+                    label="模型状态",
+                    placeholder="点击「加载视频模型」以载入/重载模型（切换 mmgp / Flash Attention 后须重新加载）",
+                    interactive=False,
+                    scale=4,
+                )
+            vid_load_btn.click(
+                load_video_model,
+                inputs=[global_model, global_fa, global_mmgp, global_mmgp_profile],
+                outputs=[img_load_status, vid_load_status],
+                concurrency_limit=1,
+            )
             with gr.Tabs():
 
                 # ---------- 文本跟踪 ----------
@@ -2008,6 +2128,14 @@ def build_ui():
                         outputs=[vid_box_output, vid_box_status],
                         concurrency_limit=1,
                     )
+
+        # 两个加载按鈕的事件绑定（必须定义在两个组件都创建完成之后）
+        img_load_btn.click(
+            load_image_model,
+            inputs=[global_model, global_mmgp, global_mmgp_profile],
+            outputs=[img_load_status, vid_load_status],
+            concurrency_limit=1,
+        )
 
         gr.Markdown(
             "---\n"
