@@ -369,10 +369,27 @@ class SAM3Inference:
             from sam3 import build_sam3_image_model
             from sam3.model.sam3_image_processor import Sam3Processor
             print(f"[SAM3] 加载图像分割模型 ({self.version})...")
+            # mmgp 启用时先在 CPU 加载：模型权重不占 GPU 显存
+            # mmgp hook 后推理时按需 onload 到 GPU，这才是真正的显存 offload
+            load_device = "cpu" if (self.use_mmgp and _MMGP_AVAILABLE) else DEVICE
             model = build_sam3_image_model(
                 bpe_path=self.bpe_path, checkpoint_path=self._ckpt,
+                device=load_device,
             )
-            self._apply_mmgp(model, "image.model")
+            self._apply_mmgp(model, "image.model", quantizeTransformer=False, asyncTransfers=False)
+            if self.use_mmgp and _MMGP_AVAILABLE:
+                # decoder.py forward_ffn 显式禁用了 autocast，导致 LayerNorm 输出 float32
+                # 而 mmgp 存储/恢复的 Linear 权重为 BFloat16，类型不匹配
+                # 注册 forward pre-hook 将 Linear 输入自动对齐到权重 dtype
+                def _cast_to_weight_dtype(module, args):
+                    if module.weight is not None and len(args) > 0:
+                        x = args[0]
+                        if isinstance(x, torch.Tensor) and x.dtype != module.weight.dtype:
+                            return (x.to(dtype=module.weight.dtype),) + args[1:]
+                    return args
+                for submod in model.modules():
+                    if isinstance(submod, torch.nn.Linear):
+                        submod.register_forward_pre_hook(_cast_to_weight_dtype)
             self._image_processor = Sam3Processor(model, confidence_threshold=self.confidence)
             print("[SAM3] 图像分割模型加载完成 [OK]")
         self._image_processor.confidence_threshold = self.confidence
