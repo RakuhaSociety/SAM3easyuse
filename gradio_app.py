@@ -196,12 +196,18 @@ def _apply_mmgp_to(module, target_name, module_key="model", **override_kwargs):
         print(f"[MMGP] 已应用到 {target_name} (profile={_mmgp_profile})")
 
 
-def _apply_mmgp_to_video_predictor(predictor, version):
+def _apply_mmgp_to_video_predictor(predictor, version, sam31_batch_size=1):
     if not _mmgp_enabled:
         return
     model = getattr(predictor, "model", None)
     if model is None:
         return
+
+    def _param_mb(mod):
+        try:
+            return sum(p.numel() * p.element_size() for p in mod.parameters()) / 1024**2
+        except Exception:
+            return 0.0
 
     # 在 mmgp 卸载参数前，强制触发 _device 缓存为 CUDA
     for _obj in [model, getattr(model, "detector", None)]:
@@ -218,6 +224,8 @@ def _apply_mmgp_to_video_predictor(predictor, version):
     _detector = getattr(model, "detector", None)
     _bb = getattr(_detector, "backbone", None) if _detector is not None else None
     if _bb is not None:
+        _bb_mb = _param_mb(_bb)
+        print(f"[MMGP] 准备卸载 detector.backbone ({_bb_mb:.0f} MB) 到 RAM ...")
         _apply_mmgp_to(
             _bb,
             f"video.{version}.detector.backbone",
@@ -229,6 +237,8 @@ def _apply_mmgp_to_video_predictor(predictor, version):
     # 2. 挂载 tracker
     tracker = getattr(model, "tracker", None)
     if tracker is not None:
+        _trk_mb = _param_mb(tracker)
+        print(f"[MMGP] 准备卸载 tracker ({_trk_mb:.0f} MB) 到 RAM ...")
         _apply_mmgp_to(
             tracker,
             f"video.{version}.tracker",
@@ -236,6 +246,37 @@ def _apply_mmgp_to_video_predictor(predictor, version):
             quantizeTransformer=False,
             asyncTransfers=False,
         )
+
+    # 3. SAM3.1 专项：把 tracker 推理状态按帧卸载到 CPU RAM
+    #    原因：SAM3.1 tracker 默认把每帧的 maskmem_features、pred_masks、
+    #    image_features 全部留在 GPU（offload_output_to_cpu_for_eval=False）。
+    #    随着视频帧数增加，这些中间张量会持续积累，导致显存拉满。
+    #    代码已预留 .cpu()/.cuda() 的完整 offload 流程，只需打开此开关即可。
+    if version == "sam3.1":
+        # tracker = Sam3MultiplexPredictorWrapper → .model = Sam3VideoTrackingMultiplexDemo
+        _inner = getattr(tracker, "model", None) if tracker is not None else None
+        if _inner is not None and hasattr(_inner, "offload_output_to_cpu_for_eval"):
+            _inner.offload_output_to_cpu_for_eval = True
+            print("[MMGP] SAM3.1 tracker: 已启用 offload_output_to_cpu_for_eval=True（推理状态按帧卸载到 CPU RAM）")
+        # 同步设置 fill_hole_area=0 下的 non-cond 帧裁剪，进一步限制显存积累
+        if _inner is not None and hasattr(_inner, "trim_past_non_cond_mem_for_eval"):
+            _inner.trim_past_non_cond_mem_for_eval = True
+            print("[MMGP] SAM3.1 tracker: 已启用 trim_past_non_cond_mem_for_eval=True（裁剪旧非条件帧记忆）")
+
+    # 4. SAM3.1 专项：控制批量 grounding 大小以平衡显存与速度
+    #    batched_grounding_batch_size=16（默认）: backbone 一次处理 16 帧，速度快但激活内存 ×16（~1.5 GB）
+    #    batched_grounding_batch_size=1（mmgp 建议）: 逐帧处理，显存降至与 SAM3 相当
+    if version == "sam3.1" and model is not None:
+        _eff_batch = int(sam31_batch_size)
+        _use_batched = _eff_batch > 1
+        if hasattr(model, "use_batched_grounding"):
+            model.use_batched_grounding = _use_batched
+            print(f"[MMGP] SAM3.1: use_batched_grounding={_use_batched}（batch={_eff_batch}）")
+        if hasattr(model, "batched_grounding_batch_size"):
+            model.batched_grounding_batch_size = _eff_batch
+        if hasattr(model, "postprocess_batch_size"):
+            model.postprocess_batch_size = _eff_batch
+            print(f"[MMGP] SAM3.1: postprocess_batch_size={_eff_batch}")
 
 
 def get_image_processor(version="sam3"):
@@ -247,11 +288,28 @@ def get_image_processor(version="sam3"):
             from sam3 import build_sam3_image_model
             from sam3.model.sam3_image_processor import Sam3Processor
             print(f"[SAM3] 导入成功，正在加载图像分割模型 ({version})...")
+            # mmgp 启用时先在 CPU 加载：模型权重不占 GPU 显存
+            # mmgp hook 后推理时按需 onload 到 GPU，这才是真正的显存 offload
+            load_device = "cpu" if (_mmgp_enabled and _MMGP_AVAILABLE) else DEVICE
             model = build_sam3_image_model(
                 bpe_path=BPE_PATH,
                 checkpoint_path=ckpt,
+                device=load_device,
             )
             _apply_mmgp_to(model, f"image.{version}.model", quantizeTransformer=False, asyncTransfers=False)
+            if _mmgp_enabled and _MMGP_AVAILABLE:
+                # decoder.py forward_ffn 显式禁用了 autocast，导致 LayerNorm 输出 float32
+                # 而 mmgp 存储/恢复的 Linear 权重为 BFloat16，类型不匹配
+                # 注册 forward pre-hook 将 Linear 输入自动对齐到权重 dtype
+                def _cast_to_weight_dtype(module, args):
+                    if module.weight is not None and len(args) > 0:
+                        x = args[0]
+                        if isinstance(x, torch.Tensor) and x.dtype != module.weight.dtype:
+                            return (x.to(dtype=module.weight.dtype),) + args[1:]
+                    return args
+                for submod in model.modules():
+                    if isinstance(submod, torch.nn.Linear):
+                        submod.register_forward_pre_hook(_cast_to_weight_dtype)
             _image_processor = Sam3Processor(model, confidence_threshold=0.5)
             print(f"[SAM3] 图像分割模型 ({version}) 加载完成 ✓")
         except Exception as e:
@@ -490,6 +548,9 @@ def segment_image(image, text_prompt, confidence, mask_mode=False, model_version
         gr.Warning("请输入文本提示")
         return None, "⚠ 请输入文本提示"
 
+    if _image_processor is None:
+        return None, "⚠ 图像模型未加载，请先点击「加载图像模型」按钮"
+
     _set_mmgp_config(use_mmgp, mmgp_profile)
     _ensure_mode(f"image_{model_version}")
     try:
@@ -549,6 +610,9 @@ def segment_image_with_boxes(original_image, boxes_data, text_prompt, confidence
     if not boxes_data:
         gr.Warning("请先画框标记目标区域")
         return None, "⚠ 请先画框标记目标区域"
+
+    if _image_processor is None:
+        return None, "⚠ 图像模型未加载，请先点击「加载图像模型」按钮"
 
     _set_mmgp_config(use_mmgp, mmgp_profile)
     _ensure_mode(f"image_{model_version}")
@@ -857,6 +921,9 @@ def track_video_text(video_path, text_prompt, model_version, mask_mode=False,
         gr.Warning("请输入文本提示")
         return None, "⚠ 请输入文本提示"
 
+    if model_version not in _video_predictors:
+        return None, "⚠ 视频模型未加载，请先点击「加载视频模型」按钮"
+
     _set_mmgp_config(use_mmgp, mmgp_profile)
     _ensure_mode(f"video_{model_version}")
     try:
@@ -973,6 +1040,9 @@ def track_video_points(video_path, points, model_version, mask_mode=False,
     if not points:
         return None, "⚠ 请先在首帧上标记至少一个点"
 
+    if model_version not in _video_predictors:
+        return None, "⚠ 视频模型未加载，请先点击「加载视频模型」按钮"
+
     _set_mmgp_config(use_mmgp, mmgp_profile)
     _ensure_mode(f"video_{model_version}")
     try:
@@ -1051,6 +1121,9 @@ def track_video_box(video_path, vid_box_data, model_version, mask_mode=False,
     text_prompt = (text_prompt or "").strip()
     print(f"\n[SAM3] === 视频框选跟踪: box=({box_x1},{box_y1},{box_x2},{box_y2}), "
           f"text='{text_prompt}', model={model_version}, mask={mask_mode} ===")
+
+    if model_version not in _video_predictors:
+        return None, "⚠ 视频模型未加载，请先点击「加载视频模型」按钮"
 
     _set_mmgp_config(use_mmgp, mmgp_profile)
     _ensure_mode(f"video_{model_version}")
@@ -1270,6 +1343,9 @@ def segment_with_points(original_image, points, mask_mode=False, model_version="
         gr.Warning("请先点击图片标记至少一个点")
         return None, "⚠ 请先标记至少一个点"
 
+    if _interactive_model is None:
+        return None, "⚠ 图像模型未加载，请先点击「加载图像模型」按钮"
+
     _set_mmgp_config(use_mmgp, mmgp_profile)
     _ensure_mode(f"interactive_{model_version}")
     try:
@@ -1378,6 +1454,8 @@ def batch_segment(source_mode, folder_path, video_file, text_prompt, confidence,
     print(f"\n[SAM3] === 批量分割: mode={source_mode}, prompt='{text_prompt}', conf={confidence}, mask={mask_mode}, ver={model_version} ===")
     if not text_prompt or not text_prompt.strip():
         return [], None, "⚠ 请输入文本提示"
+    if _image_processor is None:
+        return [], None, "⚠ 图像模型未加载，请先点击「加载图像模型」按钮"
 
     _set_mmgp_config(use_mmgp, mmgp_profile)
     _ensure_mode(f"image_{model_version}")
@@ -1509,6 +1587,99 @@ def batch_segment(source_mode, folder_path, video_file, text_prompt, confidence,
 
 
 # ============================================================
+# 模型显式加载（供 UI 按钮调用）
+# ============================================================
+
+def load_image_model(model_version, use_mmgp, mmgp_profile):
+    """显式加载/重载图像模型。强制卸载旧模型使 mmgp 设置立即生效。"""
+    global _image_processor, _interactive_model, _interactive_processor, _video_predictors, _active_mode
+    print(f"\n[SAM3] === 显式加载图像模型: ver={model_version}, mmgp={use_mmgp}, profile={mmgp_profile} ===")
+    # 强制卸载旧图像/交互式模型，确保新 mmgp 设置干净生效
+    if _image_processor is not None:
+        print("[SAM3] 卸载旧图像分割模型...")
+        del _image_processor
+        _image_processor = None
+    if _interactive_model is not None:
+        print("[SAM3] 卸载旧交互式分割模型...")
+        del _interactive_model, _interactive_processor
+        _interactive_model = None
+        _interactive_processor = None
+    # 同时卸载视频模型（显存只够一侧）
+    for ver in list(_video_predictors.keys()):
+        print(f"[SAM3] 卸载视频模型 ({ver}) 以释放显存...")
+        del _video_predictors[ver]
+    _video_predictors.clear()
+    _active_mode = None
+    _cleanup_gpu()
+
+    _set_mmgp_config(use_mmgp, mmgp_profile)
+    try:
+        _ensure_mode(f"image_{model_version}")
+        get_image_processor(model_version)
+        mmgp_note = f"（mmgp profile={mmgp_profile}）" if use_mmgp else "（未启用 mmgp）"
+        img_status = f"✅ 图像模型 ({model_version}) 加载完成 {mmgp_note}"
+        vid_status = "⚠ 视频模型已卸载（加载图像模型时释放显存）——如需视频推理请重新加载"
+        return img_status, vid_status
+    except Exception as e:
+        traceback.print_exc()
+        err = f"❌ 图像模型加载失败: {e}"
+        return err, ""
+
+
+def load_video_model(model_version, use_fa3, use_mmgp, mmgp_profile, sam31_batch_size=16):
+    """显式加载/重载视频模型。强制卸载旧模型使 mmgp 设置立即生效。"""
+    global _image_processor, _interactive_model, _interactive_processor, _video_predictors, _video_use_fa, _active_mode
+    print(f"\n[SAM3] === 显式加载视频模型: ver={model_version}, fa={use_fa3}, mmgp={use_mmgp}, profile={mmgp_profile}, sam31_batch={sam31_batch_size} ===")
+    # 强制卸载所有已缓存的视频预测器
+    for ver in list(_video_predictors.keys()):
+        print(f"[SAM3] 卸载旧视频模型 ({ver})...")
+        del _video_predictors[ver]
+    _video_predictors.clear()
+    _video_use_fa = use_fa3
+    # 同时卸载图像/交互式模型（显存只够一侧）
+    if _image_processor is not None:
+        print("[SAM3] 卸载图像分割模型以释放显存...")
+        del _image_processor
+        _image_processor = None
+    if _interactive_model is not None:
+        print("[SAM3] 卸载交互式分割模型以释放显存...")
+        del _interactive_model, _interactive_processor
+        _interactive_model = None
+        _interactive_processor = None
+    _active_mode = None
+    _cleanup_gpu()
+
+    _set_mmgp_config(use_mmgp, mmgp_profile)
+    try:
+        _ensure_mode(f"video_{model_version}")
+        predictor = get_video_predictor(model_version, use_fa3)
+        # 加载完成后应用 batch 参数（mmgp 路径已在 get_video_predictor 内调用过
+        # _apply_mmgp_to_video_predictor，这里再次覆盖以应用 UI 设置的 batch_size）
+        if use_mmgp and _mmgp_enabled and predictor is not None and model_version == "sam3.1":
+            _m = getattr(predictor, "model", None)
+            if _m is not None:
+                _eff = int(sam31_batch_size)
+                _use_batched = _eff > 1
+                if hasattr(_m, "use_batched_grounding"):
+                    _m.use_batched_grounding = _use_batched
+                if hasattr(_m, "batched_grounding_batch_size"):
+                    _m.batched_grounding_batch_size = _eff
+                if hasattr(_m, "postprocess_batch_size"):
+                    _m.postprocess_batch_size = _eff
+                print(f"[SAM3] SAM3.1 batched_grounding_batch_size 已设为 {_eff}")
+        fa_note = "FA2" if use_fa3 else "SDPA"
+        batch_note = f"batch={int(sam31_batch_size)}" if model_version == "sam3.1" else ""
+        mmgp_note = f"（mmgp profile={mmgp_profile}{', ' + batch_note if batch_note else ''}）" if use_mmgp else "（未启用 mmgp）"
+        vid_status = f"✅ 视频模型 ({model_version}, {fa_note}) 加载完成 {mmgp_note}"
+        img_status = "⚠ 图像模型已卸载（加载视频模型时释放显存）——如需图像推理请重新加载"
+        return img_status, vid_status
+    except Exception as e:
+        traceback.print_exc()
+        err = f"❌ 视频模型加载失败: {e}"
+        return "", err
+
+
+# ============================================================
 # Gradio UI
 # ============================================================
 
@@ -1522,7 +1693,7 @@ def build_ui():
         # ============ 顶部：全局模型选择 ============
         with gr.Row():
             global_model = gr.Radio(
-                ["sam3", "sam3.1"], value="sam3.1",
+                ["sam3", "sam3.1"], value="sam3",
                 label="模型版本（SAM3.1 使用 Object Multiplex，多对象更快）",
             )
             global_fa = gr.Checkbox(
@@ -1537,11 +1708,28 @@ def build_ui():
                 1, 4, value=4, step=1,
                 label="mmgp profile",
             )
+            sam31_batch_md = gr.Markdown(
+                "**SAM3.1 backbone 批大小**  \nbatch=16 快但显存高；（1:约7GB, 4:约9GB, 16:约12GB）",
+                visible=False,
+            )
+            sam31_batch_size = gr.Number(
+                value=4,
+                label="批大小",
+                visible=False,
+            )
 
         # ============================================================
         # 大选项卡 A：图片处理
         # ============================================================
         with gr.Tab("🖼️ 图片处理"):
+            with gr.Row():
+                img_load_btn = gr.Button("📥 加载图像模型", variant="secondary", scale=1)
+                img_load_status = gr.Textbox(
+                    label="模型状态",
+                    placeholder="点击「加载图像模型」以载入/重载模型（切换 mmgp 后须重新加载）",
+                    interactive=False,
+                    scale=4,
+                )
             with gr.Tabs():
 
                 # ---------- 文本分割 ----------
@@ -1758,6 +1946,20 @@ def build_ui():
         # 大选项卡 B：视频处理
         # ============================================================
         with gr.Tab("🎬 视频处理"):
+            with gr.Row():
+                vid_load_btn = gr.Button("📥 加载视频模型", variant="secondary", scale=1)
+                vid_load_status = gr.Textbox(
+                    label="模型状态",
+                    placeholder="点击「加载视频模型」以载入/重载模型（切换 mmgp / Flash Attention 后须重新加载）",
+                    interactive=False,
+                    scale=4,
+                )
+            vid_load_btn.click(
+                load_video_model,
+                inputs=[global_model, global_fa, global_mmgp, global_mmgp_profile, sam31_batch_size],
+                outputs=[img_load_status, vid_load_status],
+                concurrency_limit=1,
+            )
             with gr.Tabs():
 
                 # ---------- 文本跟踪 ----------
@@ -1991,6 +2193,31 @@ def build_ui():
                         outputs=[vid_box_output, vid_box_status],
                         concurrency_limit=1,
                     )
+
+        # 两个加载按鈕的事件绑定（必须定义在两个组件都创建完成之后）
+        img_load_btn.click(
+            load_image_model,
+            inputs=[global_model, global_mmgp, global_mmgp_profile],
+            outputs=[img_load_status, vid_load_status],
+            concurrency_limit=1,
+        )
+
+        # SAM3.1 batch_size 联动：模型版本或 mmgp 开关变化时更新可见性和默认值
+        def _update_batch_slider(model_version, use_mmgp):
+            is_31 = model_version == "sam3.1"
+            default_val = 4 if use_mmgp else 1
+            return gr.update(visible=is_31), gr.update(visible=is_31, value=default_val)
+
+        global_model.change(
+            _update_batch_slider,
+            inputs=[global_model, global_mmgp],
+            outputs=[sam31_batch_md, sam31_batch_size],
+        )
+        global_mmgp.change(
+            _update_batch_slider,
+            inputs=[global_model, global_mmgp],
+            outputs=[sam31_batch_md, sam31_batch_size],
+        )
 
         gr.Markdown(
             "---\n"

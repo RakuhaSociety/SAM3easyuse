@@ -283,6 +283,7 @@ class SAM3Inference:
         mask_mode: bool = False,
         use_mmgp: bool = False,
         mmgp_profile: int = 4,
+        sam31_batch_size: int = 16,
         output_dir: str = OUTPUT_DIR,
         checkpoint_sam3: str = CHECKPOINT_SAM3,
         checkpoint_sam31: str = CHECKPOINT_SAM31,
@@ -305,6 +306,7 @@ class SAM3Inference:
         self.mask_mode = mask_mode
         self.use_mmgp = use_mmgp
         self.mmgp_profile = int(mmgp_profile)
+        self.sam31_batch_size = int(sam31_batch_size)
         self.output_dir = output_dir
         self.checkpoint_sam3 = checkpoint_sam3
         self.checkpoint_sam31 = checkpoint_sam31
@@ -369,10 +371,27 @@ class SAM3Inference:
             from sam3 import build_sam3_image_model
             from sam3.model.sam3_image_processor import Sam3Processor
             print(f"[SAM3] 加载图像分割模型 ({self.version})...")
+            # mmgp 启用时先在 CPU 加载：模型权重不占 GPU 显存
+            # mmgp hook 后推理时按需 onload 到 GPU，这才是真正的显存 offload
+            load_device = "cpu" if (self.use_mmgp and _MMGP_AVAILABLE) else DEVICE
             model = build_sam3_image_model(
                 bpe_path=self.bpe_path, checkpoint_path=self._ckpt,
+                device=load_device,
             )
-            self._apply_mmgp(model, "image.model")
+            self._apply_mmgp(model, "image.model", quantizeTransformer=False, asyncTransfers=False)
+            if self.use_mmgp and _MMGP_AVAILABLE:
+                # decoder.py forward_ffn 显式禁用了 autocast，导致 LayerNorm 输出 float32
+                # 而 mmgp 存储/恢复的 Linear 权重为 BFloat16，类型不匹配
+                # 注册 forward pre-hook 将 Linear 输入自动对齐到权重 dtype
+                def _cast_to_weight_dtype(module, args):
+                    if module.weight is not None and len(args) > 0:
+                        x = args[0]
+                        if isinstance(x, torch.Tensor) and x.dtype != module.weight.dtype:
+                            return (x.to(dtype=module.weight.dtype),) + args[1:]
+                    return args
+                for submod in model.modules():
+                    if isinstance(submod, torch.nn.Linear):
+                        submod.register_forward_pre_hook(_cast_to_weight_dtype)
             self._image_processor = Sam3Processor(model, confidence_threshold=self.confidence)
             print("[SAM3] 图像分割模型加载完成 [OK]")
         self._image_processor.confidence_threshold = self.confidence
@@ -529,6 +548,29 @@ class SAM3Inference:
                 quantizeTransformer=False,
                 asyncTransfers=False,
             )
+
+        # 3. SAM3.1 专项：把 tracker 推理状态按帧卸载到 CPU RAM
+        if self.version == "sam3.1":
+            _inner = getattr(tracker, "model", None) if tracker is not None else None
+            if _inner is not None and hasattr(_inner, "offload_output_to_cpu_for_eval"):
+                _inner.offload_output_to_cpu_for_eval = True
+                print("[MMGP] SAM3.1 tracker: 已启用 offload_output_to_cpu_for_eval=True")
+            if _inner is not None and hasattr(_inner, "trim_past_non_cond_mem_for_eval"):
+                _inner.trim_past_non_cond_mem_for_eval = True
+                print("[MMGP] SAM3.1 tracker: 已启用 trim_past_non_cond_mem_for_eval=True")
+
+        # 4. SAM3.1 专项：控制批量 grounding 大小以平衡显存与速度
+        if self.version == "sam3.1" and model is not None:
+            _eff_batch = self.sam31_batch_size
+            _use_batched = _eff_batch > 1
+            if hasattr(model, "use_batched_grounding"):
+                model.use_batched_grounding = _use_batched
+                print(f"[MMGP] SAM3.1: use_batched_grounding={_use_batched} (batch={_eff_batch})")
+            if hasattr(model, "batched_grounding_batch_size"):
+                model.batched_grounding_batch_size = _eff_batch
+            if hasattr(model, "postprocess_batch_size"):
+                model.postprocess_batch_size = _eff_batch
+                print(f"[MMGP] SAM3.1: postprocess_batch_size={_eff_batch}")
 
 
     # ==================================================================
@@ -1361,6 +1403,7 @@ def main():
     common.add_argument("--no-fa", action="store_true", help="禁用 Flash Attention")
     common.add_argument("--mmgp", action="store_true", help="启用 mmgp 显存卸载")
     common.add_argument("--mmgp-profile", type=int, default=4, help="mmgp profile（默认 4）")
+    common.add_argument("--sam31-batch-size", type=int, default=1, help="SAM3.1 backbone 批大小（mmgp 建议 1，默认 1）")
     common.add_argument("-o", "--output", help="输出路径")
 
     # image-text
@@ -1420,6 +1463,7 @@ def main():
         mask_mode=args.mask,
         use_mmgp=args.mmgp,
         mmgp_profile=args.mmgp_profile,
+        sam31_batch_size=args.sam31_batch_size,
     )
 
     try:
