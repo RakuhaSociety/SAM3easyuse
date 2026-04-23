@@ -107,13 +107,23 @@ def _unload_model(name):
 def _ensure_mode(mode):
     """确保当前模式的模型已加载，并卸载其他模式的模型以释放显存。
     mode: "image_sam3", "image_sam3.1", "interactive_sam3", "interactive_sam3.1", "video_sam3", "video_sam3.1"
+    注意：image_sam3 / image_sam3.1 共用同一个 _image_processor；
+          interactive_sam3 / interactive_sam3.1 共用同一个 _interactive_model。
+          同类变量不应互相卸载，否则会把自己删除。
     """
     global _active_mode
     if _active_mode == mode:
         return
 
     all_modes = {"image_sam3", "image_sam3.1", "interactive_sam3", "interactive_sam3.1", "video_sam3", "video_sam3.1"}
-    for m in all_modes - {mode}:
+    # 排除与目标共用同一变量的兄弟模式，避免把自己卸载
+    if mode.startswith("interactive"):
+        same_var = {"interactive_sam3", "interactive_sam3.1"}
+    elif mode.startswith("image"):
+        same_var = {"image_sam3", "image_sam3.1"}
+    else:
+        same_var = set()
+    for m in all_modes - {mode} - same_var:
         _unload_model(m)
 
     _cleanup_gpu()
@@ -351,21 +361,22 @@ def get_video_predictor(version="sam3", use_fa3=True):
 
 
 def get_interactive_model(version="sam3"):
+    """交互式点击分割模型始终使用 sam3.pt（sam3.1_multiplex.pt 不含 inst_interactive_predictor 权重）"""
     global _interactive_model, _interactive_processor
     if _interactive_model is None:
         try:
-            ckpt = CHECKPOINT_SAM31 if version == "sam3.1" else CHECKPOINT_SAM3
-            print(f"[SAM3] 正在加载交互式分割模型 ({version}, enable_inst_interactivity=True)...")
+            # 交互式模型只支持 sam3.pt，与 UI 选择的版本无关
+            print(f"[SAM3] 正在加载交互式分割模型 (sam3, enable_inst_interactivity=True)...")
             from sam3 import build_sam3_image_model
             from sam3.model.sam3_image_processor import Sam3Processor
             _interactive_model = build_sam3_image_model(
                 bpe_path=BPE_PATH,
-                checkpoint_path=ckpt,
+                checkpoint_path=CHECKPOINT_SAM3,
                 enable_inst_interactivity=True,
             )
-            _apply_mmgp_to(_interactive_model, f"interactive.{version}.model", quantizeTransformer=False, asyncTransfers=False)
+            _apply_mmgp_to(_interactive_model, "interactive.sam3.model", quantizeTransformer=False, asyncTransfers=False)
             _interactive_processor = Sam3Processor(_interactive_model)
-            print(f"[SAM3] 交互式分割模型 ({version}) 加载完成 ✓")
+            print(f"[SAM3] 交互式分割模型 (sam3) 加载完成 ✓")
         except Exception as e:
             print(f"[SAM3] ✗ 交互式模型加载失败: {e}")
             traceback.print_exc()
@@ -1616,6 +1627,9 @@ def load_image_model(model_version, use_mmgp, mmgp_profile):
     try:
         _ensure_mode(f"image_{model_version}")
         get_image_processor(model_version)
+        # 交互式点击分割仅 sam3 支持（sam3.1_multiplex.pt 不含相关权重）
+        if model_version == "sam3":
+            get_interactive_model("sam3")
         mmgp_note = f"（mmgp profile={mmgp_profile}）" if use_mmgp else "（未启用 mmgp）"
         img_status = f"✅ 图像模型 ({model_version}) 加载完成 {mmgp_note}"
         vid_status = "⚠ 视频模型已卸载（加载图像模型时释放显存）——如需视频推理请重新加载"
@@ -1826,7 +1840,7 @@ def build_ui():
                     )
 
                 # ---------- 点击分割 ----------
-                with gr.Tab("👆 点击分割"):
+                with gr.Tab("👆 点击分割") as click_tab:
                     gr.Markdown(
                         "点击图片添加标记点：\n"
                         "- 🟢 **正向点**：标记目标区域  |  🔴 **负向点**：排除背景"
@@ -2212,6 +2226,11 @@ def build_ui():
             _update_batch_slider,
             inputs=[global_model, global_mmgp],
             outputs=[sam31_batch_md, sam31_batch_size],
+        )
+        global_model.change(
+            lambda m: gr.update(visible=m != "sam3.1"),
+            inputs=[global_model],
+            outputs=[click_tab],
         )
         global_mmgp.change(
             _update_batch_slider,
