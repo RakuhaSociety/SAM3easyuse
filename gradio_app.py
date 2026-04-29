@@ -117,10 +117,10 @@ def _ensure_mode(mode):
 
     all_modes = {"image_sam3", "image_sam3.1", "interactive_sam3", "interactive_sam3.1", "video_sam3", "video_sam3.1"}
     # 排除与目标共用同一变量的兄弟模式，避免把自己卸载
-    if mode.startswith("interactive"):
-        same_var = {"interactive_sam3", "interactive_sam3.1"}
-    elif mode.startswith("image"):
-        same_var = {"image_sam3", "image_sam3.1"}
+    # 注意：image_* 与 interactive_* 通过「加载图像模型」按钮一起加载，应共存而不互相卸载，
+    # 否则用了点击分割后再做文本/框选/批量分割时 _image_processor 会变成 None。
+    if mode.startswith("interactive") or mode.startswith("image"):
+        same_var = {"image_sam3", "image_sam3.1", "interactive_sam3", "interactive_sam3.1"}
     else:
         same_var = set()
     for m in all_modes - {mode} - same_var:
