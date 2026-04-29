@@ -66,7 +66,7 @@ _video_use_fa = True   # 当前视频模型是否使用 Flash Attention
 _active_mode = None  # "image_sam3", "image_sam3.1", "interactive_sam3", "interactive_sam3.1", "video_sam3", "video_sam3.1"
 _mmgp_enabled = False
 _mmgp_profile = 4
-_mmgp_applied = set()
+_mmgp_applied = {}  # target_name -> offload_obj (用于后续 release pinned host memory)
 
 COLORS = [
     (230, 25, 75), (60, 180, 75), (255, 225, 25), (0, 130, 200),
@@ -85,23 +85,45 @@ def _cleanup_gpu():
         torch.cuda.empty_cache()
 
 
+def _release_mmgp_for(prefix):
+    """Release mmgp offload objects whose target_name starts with prefix.
+    This frees pinned host memory (counted as Windows '共享 GPU' usage)."""
+    if not _mmgp_applied:
+        return
+    keys = [k for k in list(_mmgp_applied.keys()) if k.startswith(prefix)]
+    for k in keys:
+        obj = _mmgp_applied.pop(k, None)
+        if obj is None:
+            continue
+        try:
+            release_fn = getattr(obj, "release", None)
+            if callable(release_fn):
+                release_fn()
+                print(f"[MMGP] 已释放 offload ({k})")
+        except Exception as e:
+            print(f"[MMGP] 释放 offload 失败 ({k}): {e}")
+
+
 def _unload_model(name):
-    """卸载指定模型并释放显存"""
+    """卸载指定模型并释放显存（含 mmgp pinned host memory）"""
     global _image_processor, _interactive_model, _interactive_processor, _video_predictors
     if name.startswith("image") and _image_processor is not None:
         print("[SAM3] 卸载图像分割模型...")
         del _image_processor
         _image_processor = None
+        _release_mmgp_for("image.")
     elif name.startswith("interactive") and _interactive_model is not None:
         print("[SAM3] 卸载交互式分割模型...")
         del _interactive_model, _interactive_processor
         _interactive_model = None
         _interactive_processor = None
+        _release_mmgp_for("interactive.")
     elif name.startswith("video_"):
         ver = name.replace("video_", "")  # "sam3" or "sam3.1"
         if ver in _video_predictors:
             print(f"[SAM3] 卸载视频模型 ({ver})...")
             del _video_predictors[ver]
+            _release_mmgp_for(f"video.{ver}.")
 
 
 def _ensure_mode(mode):
@@ -176,7 +198,7 @@ def _apply_mmgp_to(module, target_name, module_key="model", **override_kwargs):
     if module is None:
         return
 
-    key = (target_name, id(module), tuple(sorted(override_kwargs.items())))
+    key = target_name
     if key in _mmgp_applied:
         return
 
@@ -185,16 +207,17 @@ def _apply_mmgp_to(module, target_name, module_key="model", **override_kwargs):
         print("[MMGP] 未找到可用 profile，跳过")
         return
 
+    offload_obj = None
     try:
-        _mmgp_offload.profile(module, profile_no=profile, **override_kwargs)
+        offload_obj = _mmgp_offload.profile(module, profile_no=profile, **override_kwargs)
     except Exception as e1:
         try:
-            _mmgp_offload.profile({module_key: module}, profile_no=profile, **override_kwargs)
+            offload_obj = _mmgp_offload.profile({module_key: module}, profile_no=profile, **override_kwargs)
         except Exception as e2:
             print(f"[MMGP] 应用失败 ({target_name}): {e2} (direct={e1})")
             return
 
-    _mmgp_applied.add(key)
+    _mmgp_applied[key] = offload_obj
     try:
         if hasattr(torch, "set_default_device"):
             torch.set_default_device("cpu")
@@ -298,15 +321,18 @@ def get_image_processor(version="sam3"):
             from sam3 import build_sam3_image_model
             from sam3.model.sam3_image_processor import Sam3Processor
             print(f"[SAM3] 导入成功，正在加载图像分割模型 ({version})...")
-            # mmgp 启用时先在 CPU 加载：模型权重不占 GPU 显存
-            # mmgp hook 后推理时按需 onload 到 GPU，这才是真正的显存 offload
-            load_device = "cpu" if (_mmgp_enabled and _MMGP_AVAILABLE) else DEVICE
+            # 始终先在 GPU 加载：与视频模型一致，便于在「共享 GPU」中观察 mmgp 卸载行为。
+            # mmgp 之后会把权重搬回 RAM；CUDA caching allocator 保留的闲置显存块会被驱动
+            # 计入「共享 GPU 内存」（专用显存仍会下降），与视频模型表现一致。
             model = build_sam3_image_model(
                 bpe_path=BPE_PATH,
                 checkpoint_path=ckpt,
-                device=load_device,
+                device=DEVICE,
             )
-            _apply_mmgp_to(model, f"image.{version}.model", quantizeTransformer=False, asyncTransfers=False)
+            # pinnedMemory=True 强制全部权重使用 pinned host memory，任务管理器能看到「共享 GPU」上涨。
+            # 不使用 module_key="transformer"，避免 profile 默认 budgets["transformer"]=1200 把子模块滞留 CPU
+            # （predict_inst 会绕过顶层 forward 直接调用 sam_prompt_encoder，导致 mmgp hook 不触发）。
+            _apply_mmgp_to(model, f"image.{version}.model", quantizeTransformer=False, asyncTransfers=False, pinnedMemory=True, budgets=None)
             if _mmgp_enabled and _MMGP_AVAILABLE:
                 # decoder.py forward_ffn 显式禁用了 autocast，导致 LayerNorm 输出 float32
                 # 而 mmgp 存储/恢复的 Linear 权重为 BFloat16，类型不匹配
@@ -374,7 +400,7 @@ def get_interactive_model(version="sam3"):
                 checkpoint_path=CHECKPOINT_SAM3,
                 enable_inst_interactivity=True,
             )
-            _apply_mmgp_to(_interactive_model, "interactive.sam3.model", quantizeTransformer=False, asyncTransfers=False)
+            _apply_mmgp_to(_interactive_model, "interactive.sam3.model", quantizeTransformer=False, asyncTransfers=False, pinnedMemory=True, budgets=None)
             _interactive_processor = Sam3Processor(_interactive_model)
             print(f"[SAM3] 交互式分割模型 (sam3) 加载完成 ✓")
         except Exception as e:
@@ -1690,15 +1716,18 @@ def load_image_model(model_version, use_mmgp, mmgp_profile):
         print("[SAM3] 卸载旧图像分割模型...")
         del _image_processor
         _image_processor = None
+        _release_mmgp_for("image.")
     if _interactive_model is not None:
         print("[SAM3] 卸载旧交互式分割模型...")
         del _interactive_model, _interactive_processor
         _interactive_model = None
         _interactive_processor = None
+        _release_mmgp_for("interactive.")
     # 同时卸载视频模型（显存只够一侧）
     for ver in list(_video_predictors.keys()):
         print(f"[SAM3] 卸载视频模型 ({ver}) 以释放显存...")
         del _video_predictors[ver]
+        _release_mmgp_for(f"video.{ver}.")
     _video_predictors.clear()
     _active_mode = None
     _cleanup_gpu()
@@ -1728,6 +1757,7 @@ def load_video_model(model_version, use_fa3, use_mmgp, mmgp_profile, sam31_batch
     for ver in list(_video_predictors.keys()):
         print(f"[SAM3] 卸载旧视频模型 ({ver})...")
         del _video_predictors[ver]
+        _release_mmgp_for(f"video.{ver}.")
     _video_predictors.clear()
     _video_use_fa = use_fa3
     # 同时卸载图像/交互式模型（显存只够一侧）
@@ -1735,11 +1765,13 @@ def load_video_model(model_version, use_fa3, use_mmgp, mmgp_profile, sam31_batch
         print("[SAM3] 卸载图像分割模型以释放显存...")
         del _image_processor
         _image_processor = None
+        _release_mmgp_for("image.")
     if _interactive_model is not None:
         print("[SAM3] 卸载交互式分割模型以释放显存...")
         del _interactive_model, _interactive_processor
         _interactive_model = None
         _interactive_processor = None
+        _release_mmgp_for("interactive.")
     _active_mode = None
     _cleanup_gpu()
 
