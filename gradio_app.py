@@ -107,13 +107,23 @@ def _unload_model(name):
 def _ensure_mode(mode):
     """确保当前模式的模型已加载，并卸载其他模式的模型以释放显存。
     mode: "image_sam3", "image_sam3.1", "interactive_sam3", "interactive_sam3.1", "video_sam3", "video_sam3.1"
+    注意：image_sam3 / image_sam3.1 共用同一个 _image_processor；
+          interactive_sam3 / interactive_sam3.1 共用同一个 _interactive_model。
+          同类变量不应互相卸载，否则会把自己删除。
     """
     global _active_mode
     if _active_mode == mode:
         return
 
     all_modes = {"image_sam3", "image_sam3.1", "interactive_sam3", "interactive_sam3.1", "video_sam3", "video_sam3.1"}
-    for m in all_modes - {mode}:
+    # 排除与目标共用同一变量的兄弟模式，避免把自己卸载
+    if mode.startswith("interactive"):
+        same_var = {"interactive_sam3", "interactive_sam3.1"}
+    elif mode.startswith("image"):
+        same_var = {"image_sam3", "image_sam3.1"}
+    else:
+        same_var = set()
+    for m in all_modes - {mode} - same_var:
         _unload_model(m)
 
     _cleanup_gpu()
@@ -351,21 +361,22 @@ def get_video_predictor(version="sam3", use_fa3=True):
 
 
 def get_interactive_model(version="sam3"):
+    """交互式点击分割模型始终使用 sam3.pt（sam3.1_multiplex.pt 不含 inst_interactive_predictor 权重）"""
     global _interactive_model, _interactive_processor
     if _interactive_model is None:
         try:
-            ckpt = CHECKPOINT_SAM31 if version == "sam3.1" else CHECKPOINT_SAM3
-            print(f"[SAM3] 正在加载交互式分割模型 ({version}, enable_inst_interactivity=True)...")
+            # 交互式模型只支持 sam3.pt，与 UI 选择的版本无关
+            print(f"[SAM3] 正在加载交互式分割模型 (sam3, enable_inst_interactivity=True)...")
             from sam3 import build_sam3_image_model
             from sam3.model.sam3_image_processor import Sam3Processor
             _interactive_model = build_sam3_image_model(
                 bpe_path=BPE_PATH,
-                checkpoint_path=ckpt,
+                checkpoint_path=CHECKPOINT_SAM3,
                 enable_inst_interactivity=True,
             )
-            _apply_mmgp_to(_interactive_model, f"interactive.{version}.model", quantizeTransformer=False, asyncTransfers=False)
+            _apply_mmgp_to(_interactive_model, "interactive.sam3.model", quantizeTransformer=False, asyncTransfers=False)
             _interactive_processor = Sam3Processor(_interactive_model)
-            print(f"[SAM3] 交互式分割模型 ({version}) 加载完成 ✓")
+            print(f"[SAM3] 交互式分割模型 (sam3) 加载完成 ✓")
         except Exception as e:
             print(f"[SAM3] ✗ 交互式模型加载失败: {e}")
             traceback.print_exc()
@@ -769,16 +780,22 @@ def _start_video_session(predictor, video_path):
 
 def _propagate_and_render(predictor, session_id, frames, fps, first_output,
                           progress, progress_start=0.15, mask_mode=False,
-                          prompt_frame_idx=0):
-    """传播跟踪并渲染输出视频"""
+                          prompt_frame_idx=0, start_frame_index=None):
+    """传播跟踪并渲染输出视频
+    start_frame_index: 传给 propagate_in_video，对纯点击跟踪（SAM3.1）可绕过 previous_stages_out 空检查
+    """
     total = len(frames)
     outputs_per_frame = {prompt_frame_idx: first_output}
 
+    propagate_req = {
+        "type": "propagate_in_video",
+        "session_id": session_id,
+    }
+    if start_frame_index is not None:
+        propagate_req["start_frame_index"] = start_frame_index
+
     with torch.autocast("cuda", dtype=torch.bfloat16):
-        for resp in predictor.handle_stream_request({
-            "type": "propagate_in_video",
-            "session_id": session_id,
-        }):
+        for resp in predictor.handle_stream_request(propagate_req):
             fidx = resp["frame_index"]
             outputs_per_frame[fidx] = resp["outputs"]
         pct = progress_start + 0.50 * (len(outputs_per_frame) / total)
@@ -1032,7 +1049,7 @@ def confirm_frame_selection(preview_img, frame_idx):
 def track_video_points(video_path, points, model_version, mask_mode=False,
                        use_fa3=True, use_mmgp=False, mmgp_profile=4,
                        start_frame_idx=0, progress=gr.Progress()):
-    """使用点击提示跟踪视频（底层 tracker API）"""
+    """使用点击提示跟踪视频。SAM3 走底层 tracker API；SAM3.1 走高层 predictor API。"""
     start_frame_idx = int(start_frame_idx)
     print(f"\n[SAM3] === 视频点击跟踪: {len(points) if points else 0} 点, model={model_version}, mask={mask_mode}, fa={use_fa3}, start_frame={start_frame_idx} ===")
     if video_path is None:
@@ -1045,91 +1062,9 @@ def track_video_points(video_path, points, model_version, mask_mode=False,
 
     _set_mmgp_config(use_mmgp, mmgp_profile)
     _ensure_mode(f"video_{model_version}")
-    try:
-        tracker = _get_tracker(model_version, use_fa3=use_fa3)
-    except Exception as e:
-        return None, f"模型加载失败: {e}"
 
-    progress(0, desc="正在初始化视频...")
-    try:
-        cap = cv2.VideoCapture(video_path)
-        fps = cap.get(cv2.CAP_PROP_FPS) or 30
-        frames = []
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-        cap.release()
-        if not frames:
-            return None, "⚠ 无法读取视频帧"
-
-        h, w = frames[0].shape[:2]
-        total = len(frames)
-        print(f"[SAM3] 视频: {total} 帧, {w}x{h}")
-
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            inference_state = tracker.init_state(video_path=video_path)
-    except Exception as e:
-        return None, f"初始化失败: {e}"
-
-    progress(0.1, desc="正在添加点提示...")
-    # 归一化坐标 0~1
-    pts_tensor = torch.tensor([[x / w, y / h] for x, y, _ in points], dtype=torch.float32)
-    lbl_tensor = torch.tensor([l for _, _, l in points], dtype=torch.int32)
-
-    try:
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            _, out_obj_ids, low_res, video_res = tracker.add_new_points_or_box(
-                inference_state=inference_state,
-                frame_idx=start_frame_idx,
-                obj_id=1,
-                points=pts_tensor,
-                labels=lbl_tensor,
-                clear_old_points=False,
-            )
-        print(f"[SAM3] 第{start_frame_idx}帧点提示: obj_ids={out_obj_ids}")
-    except Exception as e:
-        traceback.print_exc()
-        return None, f"添加提示失败: {e}"
-
-    progress(0.15, desc="正在传播跟踪...")
-    try:
-        output_path = _tracker_propagate_and_render(
-            tracker, inference_state, frames, fps, progress,
-            mask_mode=mask_mode)
-    except Exception as e:
-        traceback.print_exc()
-        return None, f"跟踪出错: {e}"
-
-    progress(1.0, desc="完成!")
-    del inference_state, frames
-    _cleanup_gpu()
-    return output_path, f"✅ 点击跟踪完成 ({model_version}): {total} 帧"
-
-
-def track_video_box(video_path, vid_box_data, model_version, mask_mode=False,
-                    text_prompt="", use_fa3=True, use_mmgp=False, mmgp_profile=4,
-                    start_frame_idx=0, progress=gr.Progress()):
-    """使用框选提示跟踪视频。有文本时走高层 API（文本+框联合），无文本时走底层 tracker API（纯框分割）"""
-    start_frame_idx = int(start_frame_idx)
-    if video_path is None:
-        return None, "⚠ 请先上传视频"
-    if not vid_box_data:
-        return None, "⚠ 请先在首帧上画框"
-    box_x1, box_y1, box_x2, box_y2 = vid_box_data[0][:4]
-    text_prompt = (text_prompt or "").strip()
-    print(f"\n[SAM3] === 视频框选跟踪: box=({box_x1},{box_y1},{box_x2},{box_y2}), "
-          f"text='{text_prompt}', model={model_version}, mask={mask_mode} ===")
-
-    if model_version not in _video_predictors:
-        return None, "⚠ 视频模型未加载，请先点击「加载视频模型」按钮"
-
-    _set_mmgp_config(use_mmgp, mmgp_profile)
-    _ensure_mode(f"video_{model_version}")
-
-    if text_prompt:
-        # ---- 有文本：高层 handle_request API（文本+框联合检测） ----
+    if model_version == "sam3.1":
+        # SAM3.1 使用高层 predictor API（init_state 接受 resource_path，不接受 video_path）
         try:
             predictor = get_video_predictor(model_version, use_fa3=use_fa3)
         except Exception as e:
@@ -1143,41 +1078,35 @@ def track_video_box(video_path, vid_box_data, model_version, mask_mode=False,
 
         h, w = frames[0].shape[:2]
         total = len(frames)
-        print(f"[SAM3] 视频: {total} 帧, {w}x{h}, {fps:.1f}fps (高层 API)")
-        progress(0.1, desc="正在添加文本+框提示...")
+        print(f"[SAM3] 视频: {total} 帧, {w}x{h} (SAM3.1 高层 API)")
+        progress(0.1, desc="正在添加点提示...")
 
-        # 归一化框坐标 → xywh 格式 [xmin, ymin, width, height] 0~1
-        nx1, ny1 = box_x1 / w, box_y1 / h
-        nw, nh = (box_x2 - box_x1) / w, (box_y2 - box_y1) / h
-
+        pts_norm = [[x / w, y / h] for x, y, _ in points]
+        lbls = [int(l) for _, _, l in points]
         try:
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 response = predictor.handle_request({
                     "type": "add_prompt",
                     "session_id": session_id,
                     "frame_index": start_frame_idx,
-                    "text": text_prompt,
-                    "bounding_boxes": [[nx1, ny1, nw, nh]],
-                    "bounding_box_labels": [1],
+                    "points": pts_norm,
+                    "point_labels": lbls,
+                    "obj_id": 1,
                 })
         except Exception as e:
             predictor.handle_request({"type": "close_session", "session_id": session_id})
             traceback.print_exc()
             return None, f"添加提示失败: {e}"
 
-        first_output = response.get("outputs", {})
-        obj_ids = first_output.get("out_obj_ids", [])
-        n_objects = len(obj_ids) if hasattr(obj_ids, '__len__') else 0
-        print(f"[SAM3] 第{start_frame_idx}帧检测: {n_objects} 个对象")
-        if n_objects == 0:
-            predictor.handle_request({"type": "close_session", "session_id": session_id})
-            return None, "⚠ 在指定帧未检测到目标"
+        first_output = response.get("outputs") or {}
+        print(f"[SAM3] 第{start_frame_idx}帧点提示完成")
 
         progress(0.15, desc="正在传播跟踪...")
         try:
             output_path, _ = _propagate_and_render(
                 predictor, session_id, frames, fps, first_output, progress,
-                mask_mode=mask_mode, prompt_frame_idx=start_frame_idx)
+                mask_mode=mask_mode, prompt_frame_idx=start_frame_idx,
+                start_frame_index=start_frame_idx)
         except Exception as e:
             traceback.print_exc()
             predictor.handle_request({"type": "close_session", "session_id": session_id})
@@ -1187,11 +1116,10 @@ def track_video_box(video_path, vid_box_data, model_version, mask_mode=False,
         progress(1.0, desc="完成!")
         del frames
         _cleanup_gpu()
-        return output_path, (f"✅ 框选+文本跟踪完成 ({model_version}): "
-                             f"{n_objects} 个对象, {total} 帧 (文本: '{text_prompt}')")
+        return output_path, f"✅ 点击跟踪完成 ({model_version}): {total} 帧"
 
     else:
-        # ---- 无文本：底层 tracker API（纯框分割） ----
+        # SAM3 使用底层 tracker API
         try:
             tracker = _get_tracker(model_version, use_fa3=use_fa3)
         except Exception as e:
@@ -1213,15 +1141,178 @@ def track_video_box(video_path, vid_box_data, model_version, mask_mode=False,
 
             h, w = frames[0].shape[:2]
             total = len(frames)
-            print(f"[SAM3] 视频: {total} 帧, {w}x{h} (底层 tracker API)")
+            print(f"[SAM3] 视频: {total} 帧, {w}x{h}")
 
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 inference_state = tracker.init_state(video_path=video_path)
+            # MMGP 会把参数卸载到 CPU，导致 tracker.device 返回 cpu；
+            # 强制覆盖为 cuda，确保 add_new_points_or_box 内部把张量移到正确设备
+            inference_state["device"] = torch.device("cuda")
+        except Exception as e:
+            return None, f"初始化失败: {e}"
+
+        progress(0.1, desc="正在添加点提示...")
+        pts_tensor = torch.tensor([[x / w, y / h] for x, y, _ in points], dtype=torch.float32).cuda()
+        lbl_tensor = torch.tensor([l for _, _, l in points], dtype=torch.int32).cuda()
+
+        try:
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                _, out_obj_ids, low_res, video_res = tracker.add_new_points_or_box(
+                    inference_state=inference_state,
+                    frame_idx=start_frame_idx,
+                    obj_id=1,
+                    points=pts_tensor,
+                    labels=lbl_tensor,
+                    clear_old_points=False,
+                )
+            print(f"[SAM3] 第{start_frame_idx}帧点提示: obj_ids={out_obj_ids}")
+        except Exception as e:
+            traceback.print_exc()
+            return None, f"添加提示失败: {e}"
+
+        progress(0.15, desc="正在传播跟踪...")
+        try:
+            output_path = _tracker_propagate_and_render(
+                tracker, inference_state, frames, fps, progress,
+                mask_mode=mask_mode)
+        except Exception as e:
+            traceback.print_exc()
+            return None, f"跟踪出错: {e}"
+
+        progress(1.0, desc="完成!")
+        del inference_state, frames
+        _cleanup_gpu()
+        return output_path, f"✅ 点击跟踪完成 ({model_version}): {total} 帧"
+
+
+def track_video_box(video_path, vid_box_data, model_version, mask_mode=False,
+                    text_prompt="", use_fa3=True, use_mmgp=False, mmgp_profile=4,
+                    start_frame_idx=0, progress=gr.Progress()):
+    """使用框选提示跟踪视频。
+    SAM3.1（无论是否有文本）或 SAM3+有文本 → 高层 predictor API；
+    SAM3+无文本 → 底层 tracker API（add_new_points_or_box）。
+    """
+    start_frame_idx = int(start_frame_idx)
+    if video_path is None:
+        return None, "⚠ 请先上传视频"
+    if not vid_box_data:
+        return None, "⚠ 请先在首帧上画框"
+    box_x1, box_y1, box_x2, box_y2 = vid_box_data[0][:4]
+    text_prompt = (text_prompt or "").strip()
+    print(f"\n[SAM3] === 视频框选跟踪: box=({box_x1},{box_y1},{box_x2},{box_y2}), "
+          f"text='{text_prompt}', model={model_version}, mask={mask_mode} ===")
+
+    if model_version not in _video_predictors:
+        return None, "⚠ 视频模型未加载，请先点击「加载视频模型」按钮"
+
+    _set_mmgp_config(use_mmgp, mmgp_profile)
+    _ensure_mode(f"video_{model_version}")
+
+    if text_prompt or model_version == "sam3.1":
+        # ---- 高层 handle_request API（SAM3.1 全部走这里；SAM3+有文本也走这里） ----
+        try:
+            predictor = get_video_predictor(model_version, use_fa3=use_fa3)
+        except Exception as e:
+            return None, f"模型加载失败: {e}"
+
+        progress(0, desc="正在读取视频...")
+        try:
+            session_id, frames, fps = _start_video_session(predictor, video_path)
+        except Exception as e:
+            return None, f"启动会话失败: {e}"
+
+        h, w = frames[0].shape[:2]
+        total = len(frames)
+        prompt_desc = f"文本+框" if text_prompt else "纯框"
+        print(f"[SAM3] 视频: {total} 帧, {w}x{h}, {fps:.1f}fps (高层 API, {prompt_desc})")
+        progress(0.1, desc=f"正在添加{prompt_desc}提示...")
+
+        # 归一化框坐标 → xywh 格式 [xmin, ymin, width, height] 0~1
+        nx1, ny1 = box_x1 / w, box_y1 / h
+        nw, nh = (box_x2 - box_x1) / w, (box_y2 - box_y1) / h
+
+        add_prompt_req = {
+            "type": "add_prompt",
+            "session_id": session_id,
+            "frame_index": start_frame_idx,
+            "bounding_boxes": [[nx1, ny1, nw, nh]],
+            "bounding_box_labels": [1],
+        }
+        if text_prompt:
+            add_prompt_req["text"] = text_prompt
+
+        try:
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                response = predictor.handle_request(add_prompt_req)
+        except Exception as e:
+            predictor.handle_request({"type": "close_session", "session_id": session_id})
+            traceback.print_exc()
+            return None, f"添加提示失败: {e}"
+
+        first_output = response.get("outputs") or {}
+        obj_ids = first_output.get("out_obj_ids", [])
+        n_objects = len(obj_ids) if hasattr(obj_ids, '__len__') else 0
+        print(f"[SAM3] 第{start_frame_idx}帧检测: {n_objects} 个对象")
+        if n_objects == 0:
+            predictor.handle_request({"type": "close_session", "session_id": session_id})
+            return None, "⚠ 在指定帧未检测到目标"
+
+        progress(0.15, desc="正在传播跟踪...")
+        try:
+            output_path, _ = _propagate_and_render(
+                predictor, session_id, frames, fps, first_output, progress,
+                mask_mode=mask_mode, prompt_frame_idx=start_frame_idx)
+        except Exception as e:
+            traceback.print_exc()
+            predictor.handle_request({"type": "close_session", "session_id": session_id})
+            return None, f"跟踪出错: {e}"
+
+        predictor.handle_request({"type": "close_session", "session_id": session_id})
+        progress(1.0, desc="完成!")
+        del frames
+        _cleanup_gpu()
+        if text_prompt:
+            return output_path, (f"✅ 框选+文本跟踪完成 ({model_version}): "
+                                 f"{n_objects} 个对象, {total} 帧 (文本: '{text_prompt}')")
+        else:
+            return output_path, f"✅ 框选跟踪完成 ({model_version}): {n_objects} 个对象, {total} 帧"
+
+    else:
+        # ---- SAM3 + 无文本：底层 tracker API（add_new_points_or_box） ----
+        try:
+            tracker = _get_tracker(model_version, use_fa3=use_fa3)
+        except Exception as e:
+            return None, f"模型加载失败: {e}"
+
+        progress(0, desc="正在初始化视频...")
+        try:
+            cap = cv2.VideoCapture(video_path)
+            fps = cap.get(cv2.CAP_PROP_FPS) or 30
+            frames = []
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            cap.release()
+            if not frames:
+                return None, "⚠ 无法读取视频帧"
+
+            h, w = frames[0].shape[:2]
+            total = len(frames)
+            print(f"[SAM3] 视频: {total} 帧, {w}x{h} (SAM3 底层 tracker API)")
+
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                inference_state = tracker.init_state(video_path=video_path)
+            # MMGP 会把参数卸载到 CPU，导致 tracker.device 返回 cpu；强制覆盖为 cuda
+            inference_state["device"] = torch.device("cuda")
         except Exception as e:
             return None, f"初始化失败: {e}"
 
         progress(0.1, desc="正在添加框提示...")
         # tracker API 用归一化 xyxy: [x_min/W, y_min/H, x_max/W, y_max/H]
+        # 不提前 .cuda()：内部还会创建 CPU 零点张量与 box_coords cat，留给
+        # inference_state["device"]="cuda" 统一在 add_new_points_or_box 末尾搬运
         box_tensor = torch.tensor(
             [[box_x1 / w, box_y1 / h, box_x2 / w, box_y2 / h]],
             dtype=torch.float32,
@@ -1616,6 +1707,9 @@ def load_image_model(model_version, use_mmgp, mmgp_profile):
     try:
         _ensure_mode(f"image_{model_version}")
         get_image_processor(model_version)
+        # 交互式点击分割仅 sam3 支持（sam3.1_multiplex.pt 不含相关权重）
+        if model_version == "sam3":
+            get_interactive_model("sam3")
         mmgp_note = f"（mmgp profile={mmgp_profile}）" if use_mmgp else "（未启用 mmgp）"
         img_status = f"✅ 图像模型 ({model_version}) 加载完成 {mmgp_note}"
         vid_status = "⚠ 视频模型已卸载（加载图像模型时释放显存）——如需视频推理请重新加载"
@@ -1702,7 +1796,7 @@ def build_ui():
             )
             global_mmgp = gr.Checkbox(
                 label="🧠 启用 mmgp（显存卸载）",
-                value=False,
+                value=True,
             )
             global_mmgp_profile = gr.Slider(
                 1, 4, value=4, step=1,
@@ -1826,7 +1920,7 @@ def build_ui():
                     )
 
                 # ---------- 点击分割 ----------
-                with gr.Tab("👆 点击分割"):
+                with gr.Tab("👆 点击分割") as click_tab:
                     gr.Markdown(
                         "点击图片添加标记点：\n"
                         "- 🟢 **正向点**：标记目标区域  |  🔴 **负向点**：排除背景"
@@ -2212,6 +2306,11 @@ def build_ui():
             _update_batch_slider,
             inputs=[global_model, global_mmgp],
             outputs=[sam31_batch_md, sam31_batch_size],
+        )
+        global_model.change(
+            lambda m: gr.update(visible=m != "sam3.1"),
+            inputs=[global_model],
+            outputs=[click_tab],
         )
         global_mmgp.change(
             _update_batch_slider,
