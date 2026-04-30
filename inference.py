@@ -23,11 +23,14 @@ SAM3 Inference — 统一推理接口 & CLI 工具
     # 视频点击跟踪
     python inference.py video-points -v input.mp4 --points 200,150,1 --frame 30 -o tracked.mp4
 
-    # 视频框选跟踪
-    python inference.py video-box -v input.mp4 --box 100,50,400,300 --frame 0 -o tracked.mp4
+    # 视频框选跟踪（多框 + 正/负向）
+    python inference.py video-box -v input.mp4 --box 100,50,400,300 -o tracked.mp4
 
-    # 视频框选+文本跟踪
+    # 视频框选 + 文本跟踪
     python inference.py video-box -v input.mp4 --box 100,50,400,300 -t "person" -o tracked.mp4
+
+    # 多个正向框 + 负向框组合
+    python inference.py video-box -v input.mp4 --box 100,50,400,300 --neg-box 50,50,80,80 -t "face" -o tracked.mp4
 
 作为库使用:
     from inference import SAM3Inference
@@ -318,7 +321,9 @@ class SAM3Inference:
         self._video_predictor = None
         self._video_predictor_fa = None  # 记录构建时的 FA 设置
         self._active_mode = None  # "image" / "interactive" / "video"
-        self._mmgp_applied = set()
+        # target_name -> offload_obj：mmgp profile() 的返回对象，用于后续 release()
+        # 释放 pinned host memory（Windows 任务管理器「共享 GPU」上的占用）
+        self._mmgp_applied: Dict[str, object] = {}
 
         if self.use_mmgp and not _MMGP_AVAILABLE:
             print("[MMGP] 警告: 未检测到 mmgp，已忽略 --mmgp 参数")
@@ -330,22 +335,78 @@ class SAM3Inference:
     # ------ 资源管理 ------
 
     def _cleanup_gpu(self):
+        """释放 GPU 缓存与 pinned host memory（共享 GPU 显存）。
+
+        torch.cuda.empty_cache() 只清 CUDA 设备缓存，不清 pinned host
+        memory；后者要靠 torch._C._host_emptyCache()，Windows 还需要
+        EmptyWorkingSet() 才能让任务管理器「共享 GPU」数字真正下降。
+        优先调用 mmgp.offload.flush_torch_caches() 一站式处理。
+        """
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+        if _MMGP_AVAILABLE:
+            try:
+                _mmgp_offload.flush_torch_caches()
+                return
+            except Exception as e:
+                print(f"[MMGP] flush_torch_caches 失败: {e}")
+
+        # mmgp 不可用时的回退
+        try:
+            torch._C._host_emptyCache()
+        except AttributeError:
+            pass
+        if os.name == "nt":
+            try:
+                import ctypes
+                kernel32 = ctypes.windll.kernel32
+                psapi = ctypes.windll.psapi
+                PROCESS_SET_QUOTA = 0x0100
+                PROCESS_QUERY_INFORMATION = 0x0400
+                handle = kernel32.OpenProcess(
+                    PROCESS_SET_QUOTA | PROCESS_QUERY_INFORMATION, False, os.getpid()
+                )
+                if handle:
+                    psapi.EmptyWorkingSet(handle)
+                    kernel32.CloseHandle(handle)
+            except Exception:
+                pass
+
+    def _release_mmgp_for(self, prefix: str):
+        """释放 target_name 以 prefix 开头的所有 mmgp offload 对象，
+        归还 pinned host memory。"""
+        if not self._mmgp_applied:
+            return
+        keys = [k for k in list(self._mmgp_applied.keys()) if k.startswith(prefix)]
+        for k in keys:
+            obj = self._mmgp_applied.pop(k, None)
+            if obj is None:
+                continue
+            try:
+                release_fn = getattr(obj, "release", None)
+                if callable(release_fn):
+                    release_fn()
+                    print(f"[MMGP] 已释放 offload ({k})")
+            except Exception as e:
+                print(f"[MMGP] 释放 offload 失败 ({k}): {e}")
 
     def _unload(self, mode: str):
         if mode == "image" and self._image_processor is not None:
             del self._image_processor
             self._image_processor = None
+            self._release_mmgp_for("image.")
         elif mode == "interactive" and self._interactive_model is not None:
             del self._interactive_model, self._interactive_processor
             self._interactive_model = None
             self._interactive_processor = None
+            self._release_mmgp_for("interactive.")
         elif mode == "video" and self._video_predictor is not None:
             del self._video_predictor
             self._video_predictor = None
             self._video_predictor_fa = None
+            self._release_mmgp_for("video.")
 
     def _ensure_mode(self, mode: str):
         """切换模式，卸载其他模型以节省显存"""
@@ -371,14 +432,20 @@ class SAM3Inference:
             from sam3 import build_sam3_image_model
             from sam3.model.sam3_image_processor import Sam3Processor
             print(f"[SAM3] 加载图像分割模型 ({self.version})...")
-            # mmgp 启用时先在 CPU 加载：模型权重不占 GPU 显存
-            # mmgp hook 后推理时按需 onload 到 GPU，这才是真正的显存 offload
-            load_device = "cpu" if (self.use_mmgp and _MMGP_AVAILABLE) else DEVICE
+            # 与 gradio 一致：始终在 GPU 加载，代 mmgp 后续按需搬运。
+            # pinnedMemory=True 强制全部权重使用 pinned host memory，任务管理器的
+            # 「共享 GPU」会上涨；budgets=None 避免默认 budgets["transformer"]=1200
+            # 把子模块滑留 CPU（predict_inst 会绕过顶层 forward 直接调用
+            # sam_prompt_encoder，导致 mmgp hook 不触发）。
             model = build_sam3_image_model(
                 bpe_path=self.bpe_path, checkpoint_path=self._ckpt,
-                device=load_device,
+                device=DEVICE,
             )
-            self._apply_mmgp(model, "image.model", quantizeTransformer=False, asyncTransfers=False)
+            self._apply_mmgp(
+                model, f"image.{self.version}.model",
+                quantizeTransformer=False, asyncTransfers=False,
+                pinnedMemory=True, budgets=None,
+            )
             if self.use_mmgp and _MMGP_AVAILABLE:
                 # decoder.py forward_ffn 显式禁用了 autocast，导致 LayerNorm 输出 float32
                 # 而 mmgp 存储/恢复的 Linear 权重为 BFloat16，类型不匹配
@@ -402,11 +469,17 @@ class SAM3Inference:
             from sam3 import build_sam3_image_model
             from sam3.model.sam3_image_processor import Sam3Processor
             print(f"[SAM3] 加载交互式分割模型 ({self.version})...")
+            # 交互式点击分割仅 sam3 支持（sam3.1_multiplex.pt 不含相关权重）
+            ckpt = self.checkpoint_sam3
             self._interactive_model = build_sam3_image_model(
-                bpe_path=self.bpe_path, checkpoint_path=self._ckpt,
+                bpe_path=self.bpe_path, checkpoint_path=ckpt,
                 enable_inst_interactivity=True,
             )
-            self._apply_mmgp(self._interactive_model, "interactive.model")
+            self._apply_mmgp(
+                self._interactive_model, "interactive.sam3.model",
+                quantizeTransformer=False, asyncTransfers=False,
+                pinnedMemory=True, budgets=None,
+            )
             self._interactive_processor = Sam3Processor(self._interactive_model)
             print("[SAM3] 交互式分割模型加载完成 [OK]")
         return self._interactive_model, self._interactive_processor
@@ -415,6 +488,7 @@ class SAM3Inference:
         if self._video_predictor is not None and self._video_predictor_fa != self.use_fa:
             del self._video_predictor
             self._video_predictor = None
+            self._release_mmgp_for("video.")
             self._cleanup_gpu()
         if self._video_predictor is None:
             from sam3.model_builder import build_sam3_predictor
@@ -475,7 +549,7 @@ class SAM3Inference:
         if module is None:
             return
 
-        key = (target_name, id(module), tuple(sorted(override_kwargs.items())))
+        key = target_name
         if key in self._mmgp_applied:
             return
 
@@ -484,16 +558,17 @@ class SAM3Inference:
             print("[MMGP] 未找到可用 profile，跳过")
             return
 
+        offload_obj = None
         try:
-            _mmgp_offload.profile(module, profile_no=profile, **override_kwargs)
+            offload_obj = _mmgp_offload.profile(module, profile_no=profile, **override_kwargs)
         except Exception as e1:
             try:
-                _mmgp_offload.profile({module_key: module}, profile_no=profile, **override_kwargs)
+                offload_obj = _mmgp_offload.profile({module_key: module}, profile_no=profile, **override_kwargs)
             except Exception as e2:
                 print(f"[MMGP] 应用失败 ({target_name}): {e2} (direct={e1})")
                 return
 
-        self._mmgp_applied.add(key)
+        self._mmgp_applied[key] = offload_obj
         try:
             if hasattr(torch, "set_default_device"):
                 torch.set_default_device("cpu")
@@ -532,7 +607,7 @@ class SAM3Inference:
         if _bb is not None:
             self._apply_mmgp(
                 _bb,
-                "video.detector.backbone",
+                f"video.{self.version}.detector.backbone",
                 module_key="transformer",
                 quantizeTransformer=False,
                 asyncTransfers=False,
@@ -543,7 +618,7 @@ class SAM3Inference:
         if tracker is not None:
             self._apply_mmgp(
                 tracker,
-                "video.tracker",
+                f"video.{self.version}.tracker",
                 module_key="transformer",
                 quantizeTransformer=False,
                 asyncTransfers=False,
@@ -1101,23 +1176,32 @@ class SAM3Inference:
     def track_video_box(
         self,
         video_path: str,
-        box: Tuple[int, int, int, int],
+        box: Optional[Tuple[int, int, int, int]] = None,
         text: str = "",
         frame_idx: int = 0,
         mask_mode: Optional[bool] = None,
         output_path: Optional[str] = None,
         callback=None,
+        boxes: Optional[List[tuple]] = None,
     ) -> Tuple[str, dict]:
-        """使用框选提示跟踪视频，可选结合文本
+        """使用框选提示跟踪视频，可选结合文本，支持多框 + 正/负向框。
 
         Args:
             video_path: 视频路径
-            box: (x1, y1, x2, y2) 像素坐标
-            text: 可选文本提示 — 有文本走高层 API，无文本走底层 tracker
+            box: (x1,y1,x2,y2) 单框；与 ``boxes`` 互斥（兼容旧 API）
+            text: 可选文本提示
             frame_idx: 标注帧索引
             mask_mode: 二值 mask
             output_path: 输出路径
             callback: 进度回调
+            boxes: 多框列表，每项 (x1,y1,x2,y2) 或 (x1,y1,x2,y2,is_pos)；
+                   至少需要 1 个正向框
+
+        路径选择：
+            SAM3.1 / 有文本 / 多框 / 含负向框 → 高层 handle_request API（分步
+                add_prompt：第 1 框作初始 visual prompt，其余对同一 obj_id 做
+                refinement, clear_old_boxes=False）。
+            SAM3 + 无文本 + 单正向框 → 底层 tracker.add_new_points_or_box。
 
         Returns:
             (output_video_path, info_dict)
@@ -1125,13 +1209,38 @@ class SAM3Inference:
         self._ensure_mode("video")
         mmode = mask_mode if mask_mode is not None else self.mask_mode
         text = (text or "").strip()
-        x1, y1, x2, y2 = box
+
+        # ---- 归一化框输入 ----
+        raw_boxes: List[tuple] = []
+        if boxes:
+            raw_boxes.extend(boxes)
+        if box is not None:
+            raw_boxes.append(box)
+        if not raw_boxes:
+            return None, {"error": "至少需要 1 个框"}
+        norm_boxes: List[Tuple[int, int, int, int, bool]] = []
+        for b in raw_boxes:
+            if len(b) >= 5:
+                x1, y1, x2, y2, is_pos = int(b[0]), int(b[1]), int(b[2]), int(b[3]), bool(b[4])
+            else:
+                x1, y1, x2, y2 = (int(b[i]) for i in range(4))
+                is_pos = True
+            norm_boxes.append((x1, y1, x2, y2, is_pos))
+        pos_boxes = [b for b in norm_boxes if b[4]]
+        neg_boxes = [b for b in norm_boxes if not b[4]]
+        if not pos_boxes:
+            return None, {"error": "至少需要 1 个正向框"}
 
         out_path = output_path or os.path.join(
             self.output_dir, f"track_{int(time.time())}.mp4")
 
-        if text:
-            # 高层 handle_request API (文本+框联合)
+        use_high_level = (
+            bool(text) or self.version == "sam3.1"
+            or len(norm_boxes) > 1 or len(neg_boxes) > 0
+        )
+
+        if use_high_level:
+            # ---- 高层 handle_request API ----
             predictor = self._get_video_predictor()
             frames, fps = _read_video_frames(video_path)
             total = len(frames)
@@ -1143,19 +1252,47 @@ class SAM3Inference:
                 })
             session_id = resp["session_id"]
 
-            nx1, ny1 = x1 / w, y1 / h
-            nw, nh = (x2 - x1) / w, (y2 - y1) / h
+            # 归一化坐标 → xywh 0~1
+            bounding_boxes = []
+            bounding_box_labels = []
+            for x1, y1, x2, y2, is_pos in norm_boxes:
+                bounding_boxes.append([x1 / w, y1 / h, (x2 - x1) / w, (y2 - y1) / h])
+                bounding_box_labels.append(1 if is_pos else 0)
 
             try:
+                # SAM3 视频 predictor 的初始 visual prompt 一次只允许 1 个 box
+                # （sam3_video_inference.py::_get_visual_prompt），无论是否有文本。
+                # 多框时分步：第 1 框初始 + 其余对同一 obj_id 做 refinement
+                # （必须 obj_id=refine_obj_id + clear_old_boxes=False）。
                 with torch.autocast("cuda", dtype=torch.bfloat16):
-                    response = predictor.handle_request({
+                    first_req = {
                         "type": "add_prompt",
                         "session_id": session_id,
                         "frame_index": frame_idx,
-                        "text": text,
-                        "bounding_boxes": [[nx1, ny1, nw, nh]],
-                        "bounding_box_labels": [1],
-                    })
+                        "bounding_boxes": [bounding_boxes[0]],
+                        "bounding_box_labels": [bounding_box_labels[0]],
+                    }
+                    if text:
+                        first_req["text"] = text
+                    response = predictor.handle_request(first_req)
+
+                    first_outputs = response.get("outputs") or {}
+                    first_obj_ids = first_outputs.get("out_obj_ids", [])
+                    if hasattr(first_obj_ids, "tolist"):
+                        first_obj_ids = first_obj_ids.tolist()
+                    refine_obj_id = int(first_obj_ids[0]) if len(first_obj_ids) > 0 else 1
+
+                    for i in range(1, len(bounding_boxes)):
+                        response = predictor.handle_request({
+                            "type": "add_prompt",
+                            "session_id": session_id,
+                            "frame_index": frame_idx,
+                            "bounding_boxes": [bounding_boxes[i]],
+                            "bounding_box_labels": [bounding_box_labels[i]],
+                            "obj_id": refine_obj_id,
+                            "clear_old_boxes": False,
+                        })
+
                 first_output = response.get("outputs", {})
                 obj_ids = first_output.get("out_obj_ids", [])
                 n_objects = len(obj_ids) if hasattr(obj_ids, "__len__") else 0
@@ -1173,10 +1310,14 @@ class SAM3Inference:
 
             del frames
             self._cleanup_gpu()
-            return result, {"n_objects": n_objects, "total_frames": total, "text": text}
+            return result, {
+                "n_objects": n_objects, "total_frames": total,
+                "text": text, "n_pos": len(pos_boxes), "n_neg": len(neg_boxes),
+            }
 
         else:
-            # 底层 tracker API (纯框)
+            # ---- SAM3 + 无文本 + 单正向框：底层 tracker API ----
+            x1, y1, x2, y2 = pos_boxes[0][:4]
             tracker = self._get_tracker()
             frames, fps = _read_video_frames(video_path)
             total = len(frames)
@@ -1370,12 +1511,18 @@ def _parse_points(raw: list) -> List[Tuple[int, int, int]]:
     return pts
 
 
-def _parse_box(raw: str) -> Tuple[int, int, int, int]:
-    """解析 "x1,y1,x2,y2" → (x1, y1, x2, y2)"""
+def _parse_box(raw: str) -> Tuple[int, ...]:
+    """解析 "x1,y1,x2,y2" 或 "x1,y1,x2,y2,is_pos"。
+
+    is_pos: 1=正向框 (默认)，0=负向框。
+    """
     parts = raw.split(",")
-    if len(parts) != 4:
-        raise ValueError(f"框格式错误: '{raw}', 应为 x1,y1,x2,y2")
-    return tuple(int(p) for p in parts)
+    if len(parts) == 4:
+        return tuple(int(p) for p in parts)
+    if len(parts) == 5:
+        x1, y1, x2, y2 = (int(parts[i]) for i in range(4))
+        return (x1, y1, x2, y2, bool(int(parts[4])))
+    raise ValueError(f"框格式错误: '{raw}', 应为 x1,y1,x2,y2 或 x1,y1,x2,y2,is_pos")
 
 
 def main():
@@ -1403,7 +1550,7 @@ def main():
     common.add_argument("--no-fa", action="store_true", help="禁用 Flash Attention")
     common.add_argument("--mmgp", action="store_true", help="启用 mmgp 显存卸载")
     common.add_argument("--mmgp-profile", type=int, default=4, help="mmgp profile（默认 4）")
-    common.add_argument("--sam31-batch-size", type=int, default=1, help="SAM3.1 backbone 批大小（mmgp 建议 1，默认 1）")
+    common.add_argument("--sam31-batch-size", type=int, default=4, help="SAM3.1 backbone 批大小（官方默认 16，本工具默认 4 兼顾显存；mmgp 建议 1）")
     common.add_argument("-o", "--output", help="输出路径")
 
     # image-text
@@ -1446,7 +1593,10 @@ def main():
     # video-box
     p = sub.add_parser("video-box", parents=[common], help="视频框选跟踪")
     p.add_argument("-v", "--video", required=True, help="输入视频")
-    p.add_argument("--box", required=True, help="框 x1,y1,x2,y2")
+    p.add_argument("--box", action="append", default=[],
+                   help="正向框 x1,y1,x2,y2 (可多个，至少 1 个)")
+    p.add_argument("--neg-box", action="append", default=[],
+                   help="负向框 x1,y1,x2,y2 (可多个)")
     p.add_argument("-t", "--text", default="", help="可选文本提示")
     p.add_argument("--frame", type=int, default=0, help="标注帧索引")
 
@@ -1542,16 +1692,36 @@ def main():
             print(f"已保存: {result}")
 
         elif args.command == "video-box":
-            box = _parse_box(args.box)
+            pos_boxes = [_parse_box(b) for b in args.box]
+            neg_boxes = []
+            for b in args.neg_box:
+                parsed = _parse_box(b)
+                # 强制为负向框
+                neg_boxes.append((parsed[0], parsed[1], parsed[2], parsed[3], False))
+            # 保证 pos 是 5 元组，is_pos=True
+            norm_pos = []
+            for b in pos_boxes:
+                if len(b) == 5:
+                    norm_pos.append((b[0], b[1], b[2], b[3], True if bool(b[4]) else False))
+                else:
+                    norm_pos.append((b[0], b[1], b[2], b[3], True))
+            all_boxes = norm_pos + neg_boxes
+            if not all_boxes:
+                print("错误: --box 或 --neg-box 至少提供 1 个")
+                return
             out_path = args.output or os.path.join(OUTPUT_DIR, f"track_{int(time.time())}.mp4")
             result, info = sam.track_video_box(
-                args.video, box,
+                args.video, boxes=all_boxes,
                 text=args.text,
                 frame_idx=args.frame,
                 output_path=out_path, callback=_progress_printer,
             )
             if result:
-                print(f"跟踪完成: {info['total_frames']} 帧")
+                desc_parts = [f"{sum(1 for b in all_boxes if b[4])}正"]
+                n_neg = sum(1 for b in all_boxes if not b[4])
+                if n_neg:
+                    desc_parts.append(f"{n_neg}负")
+                print(f"跟踪完成 ({'+'.join(desc_parts)}): {info.get('total_frames', '?')} 帧")
                 print(f"已保存: {result}")
             else:
                 print(f"跟踪失败: {info.get('error', '未知')}")

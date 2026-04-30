@@ -141,8 +141,11 @@ python inference.py video-text -v input.mp4 -t "person" -o tracked.mp4
 # 视频点击跟踪
 python inference.py video-points -v input.mp4 --points 200,150,1 --frame 30 -o tracked.mp4
 
-# 视频框选跟踪（可选加文本）
+# 视频框选跟踪（支持多框 + 正/负向框，可选加文本）
 python inference.py video-box -v input.mp4 --box 100,50,400,300 -t "person" -o tracked.mp4
+
+# 多个正向框 + 负向框排除（例：跟踪人脸但排除画面左上角的脸）
+python inference.py video-box -v input.mp4 --box 100,50,400,300 --neg-box 10,10,80,80 -t "face" -o tracked.mp4
 ```
 
 通用选项：
@@ -152,7 +155,7 @@ python inference.py video-box -v input.mp4 --box 100,50,400,300 -t "person" -o t
 - `--no-fa` — 禁用 Flash Attention
 - `--mmgp` — 启用 mmgp 显存优化
 - `--mmgp-profile N` — mmgp profile，1–5，默认 4
-- `--sam31-batch-size N` — SAM3.1 视频 backbone 批大小（默认 1，mmgp 模式建议 4）
+- `--sam31-batch-size N` — SAM3.1 视频 backbone 批大小（CLI 默认 4；官方默认 16，启用 mmgp 建议 1）
 
 ### 作为 Python 库
 
@@ -169,12 +172,20 @@ result, info = sam.segment_image_points("photo.jpg", points=[(200, 150, 1)])
 # 视频跟踪
 path, info = sam.track_video_text("input.mp4", "person")
 path, info = sam.track_video_points("input.mp4", [(200, 150, 1)], frame_idx=30)
+
+# 视频框选跟踪：单框（旧 API 兼容）
 path, info = sam.track_video_box("input.mp4", (100, 50, 400, 300), text="person")
+# 视频框选跟踪：多框 + 负向框（每项 (x1,y1,x2,y2[,is_pos])）
+path, info = sam.track_video_box(
+    "input.mp4",
+    boxes=[(100, 50, 400, 300, True), (10, 10, 80, 80, False)],
+    text="face",
+)
 
 sam.unload_all()  # 释放显存
 ```
 
-启用 mmgp 时（SAM3.1 视频推荐设 `sam31_batch_size=4`）：
+启用 mmgp 时（SAM3.1 视频推荐设 `sam31_batch_size=1` 以最大化节省显存）：
 
 ```python
 sam = SAM3Inference(
@@ -182,7 +193,7 @@ sam = SAM3Inference(
     use_fa=True,
     use_mmgp=True,
     mmgp_profile=4,
-    sam31_batch_size=4,   # 批量 grounding，提升视频推理速度
+    sam31_batch_size=1,   # mmgp 下逐帧运行，显存需求最低
 )
 ```
 
@@ -245,18 +256,19 @@ from inference import SAM3Inference
 sam = SAM3Inference(
     version="sam3.1",
     use_fa=True,
-    use_mmgp=True,       # 启用 mmgp
-    mmgp_profile=4,      # 1-5，默认 4
+    use_mmgp=True,
+    mmgp_profile=4,
+    sam31_batch_size=1,  # mmgp 下逐帧运行节省显存
 )
 result, info = sam.segment_image_text("photo.jpg", "person")
 
-# 视频推理 + mmgp + 批处理加速（SAM3.1）
+# 视频推理 + mmgp（SAM3.1）
 sam = SAM3Inference(
     version="sam3.1",
     use_fa=True,
     use_mmgp=True,
     mmgp_profile=4,
-    sam31_batch_size=4,  # 批量 backbone 推理，提升吞吐
+    sam31_batch_size=1,
 )
 path, info = sam.track_video_text("input.mp4", "person")
 ```

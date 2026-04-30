@@ -3,7 +3,7 @@
 # =============================================================
 # 安装方式:
 #   1. 先装 PyTorch (需要额外 index-url):
-#      pip install torch==2.9.0+cu128 torchvision==0.24.0+cu128 torchaudio==2.9.0+cu128 --index-url https://download.pytorch.org/whl/cu128
+#      pip install torch==2.9.0 torchvision==0.24.0 --index-url https://download.pytorch.org/whl/cu128
 #
 #   2. 再装 Flash Attention 2 (需要预编译 whl):
 #      pip install flash_attn==2.8.3

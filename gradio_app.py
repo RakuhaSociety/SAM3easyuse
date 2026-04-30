@@ -79,10 +79,44 @@ COLORS = [
 
 
 def _cleanup_gpu():
-    """释放 GPU 缓存的中间张量"""
+    """释放 GPU 缓存与 pinned host memory（共享 GPU 显存）。
+
+    注意：torch.cuda.empty_cache() 只清 CUDA 设备缓存，不清 pinned host
+    memory；后者要通过 torch._C._host_emptyCache() 才能归还给 OS。
+    在 Windows 上还需要 EmptyWorkingSet 把进程工作集压回去，任务管理器
+    的「共享 GPU 内存」才会下降。优先用 mmgp 提供的 flush_torch_caches。
+    """
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+    if _MMGP_AVAILABLE:
+        try:
+            _mmgp_offload.flush_torch_caches()
+            return
+        except Exception as e:
+            print(f"[MMGP] flush_torch_caches 失败: {e}")
+
+    # mmgp 不可用时的回退：手动清 pinned host cache + Windows 工作集
+    try:
+        torch._C._host_emptyCache()
+    except AttributeError:
+        pass
+    if os.name == "nt":
+        try:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            psapi = ctypes.windll.psapi
+            PROCESS_SET_QUOTA = 0x0100
+            PROCESS_QUERY_INFORMATION = 0x0400
+            handle = kernel32.OpenProcess(
+                PROCESS_SET_QUOTA | PROCESS_QUERY_INFORMATION, False, os.getpid()
+            )
+            if handle:
+                psapi.EmptyWorkingSet(handle)
+                kernel32.CloseHandle(handle)
+        except Exception:
+            pass
 
 
 def _release_mmgp_for(prefix):
@@ -1214,18 +1248,33 @@ def track_video_points(video_path, points, model_version, mask_mode=False,
 def track_video_box(video_path, vid_box_data, model_version, mask_mode=False,
                     text_prompt="", use_fa3=True, use_mmgp=False, mmgp_profile=4,
                     start_frame_idx=0, progress=gr.Progress()):
-    """使用框选提示跟踪视频。
-    SAM3.1（无论是否有文本）或 SAM3+有文本 → 高层 predictor API；
-    SAM3+无文本 → 底层 tracker API（add_new_points_or_box）。
+    """使用框选提示跟踪视频。支持多框、正向框/负向框。
+    SAM3.1（任意框） / SAM3+有文本 / 多框 / 含负向框 → 高层 predictor API；
+    SAM3+无文本+单正向框 → 底层 tracker API（add_new_points_or_box）。
     """
     start_frame_idx = int(start_frame_idx)
     if video_path is None:
         return None, "⚠ 请先上传视频"
     if not vid_box_data:
         return None, "⚠ 请先在首帧上画框"
-    box_x1, box_y1, box_x2, box_y2 = vid_box_data[0][:4]
+
+    # 兼容旧数据格式（4 元组无标签）：默认视为正向框
+    norm_boxes = []
+    for b in vid_box_data:
+        if len(b) >= 5:
+            x1, y1, x2, y2, is_pos = b[0], b[1], b[2], b[3], bool(b[4])
+        else:
+            x1, y1, x2, y2 = b[:4]
+            is_pos = True
+        norm_boxes.append((x1, y1, x2, y2, is_pos))
+
+    pos_boxes = [b for b in norm_boxes if b[4]]
+    neg_boxes = [b for b in norm_boxes if not b[4]]
+    if not pos_boxes:
+        return None, "⚠ 至少需要 1 个正向框"
+
     text_prompt = (text_prompt or "").strip()
-    print(f"\n[SAM3] === 视频框选跟踪: box=({box_x1},{box_y1},{box_x2},{box_y2}), "
+    print(f"\n[SAM3] === 视频框选跟踪: 正向框={len(pos_boxes)}, 负向框={len(neg_boxes)}, "
           f"text='{text_prompt}', model={model_version}, mask={mask_mode} ===")
 
     if model_version not in _video_predictors:
@@ -1234,8 +1283,16 @@ def track_video_box(video_path, vid_box_data, model_version, mask_mode=False,
     _set_mmgp_config(use_mmgp, mmgp_profile)
     _ensure_mode(f"video_{model_version}")
 
-    if text_prompt or model_version == "sam3.1":
-        # ---- 高层 handle_request API（SAM3.1 全部走这里；SAM3+有文本也走这里） ----
+    # 任何会让底层 tracker 走不通的情况都升级到高层 API
+    use_high_level = (
+        text_prompt
+        or model_version == "sam3.1"
+        or len(norm_boxes) > 1
+        or len(neg_boxes) > 0
+    )
+
+    if use_high_level:
+        # ---- 高层 handle_request API（SAM3.1 / 有文本 / 多框 / 含负向框） ----
         try:
             predictor = get_video_predictor(model_version, use_fa3=use_fa3)
         except Exception as e:
@@ -1249,27 +1306,60 @@ def track_video_box(video_path, vid_box_data, model_version, mask_mode=False,
 
         h, w = frames[0].shape[:2]
         total = len(frames)
-        prompt_desc = f"文本+框" if text_prompt else "纯框"
+        prompt_desc_parts = []
+        if text_prompt:
+            prompt_desc_parts.append("文本")
+        prompt_desc_parts.append(f"{len(pos_boxes)}正")
+        if neg_boxes:
+            prompt_desc_parts.append(f"{len(neg_boxes)}负")
+        prompt_desc = "+".join(prompt_desc_parts)
         print(f"[SAM3] 视频: {total} 帧, {w}x{h}, {fps:.1f}fps (高层 API, {prompt_desc})")
         progress(0.1, desc=f"正在添加{prompt_desc}提示...")
 
         # 归一化框坐标 → xywh 格式 [xmin, ymin, width, height] 0~1
-        nx1, ny1 = box_x1 / w, box_y1 / h
-        nw, nh = (box_x2 - box_x1) / w, (box_y2 - box_y1) / h
+        bounding_boxes = []
+        bounding_box_labels = []
+        for x1, y1, x2, y2, is_pos in norm_boxes:
+            bounding_boxes.append([x1 / w, y1 / h, (x2 - x1) / w, (y2 - y1) / h])
+            bounding_box_labels.append(1 if is_pos else 0)
 
-        add_prompt_req = {
-            "type": "add_prompt",
-            "session_id": session_id,
-            "frame_index": start_frame_idx,
-            "bounding_boxes": [[nx1, ny1, nw, nh]],
-            "bounding_box_labels": [1],
-        }
-        if text_prompt:
-            add_prompt_req["text"] = text_prompt
-
+        # SAM3 视频 predictor 的初始 visual prompt 一次只允许 1 个 box（见
+        # sam3_video_inference.py::_get_visual_prompt），无论是否有文本都受此限制。
+        # 多框时分步调用：第 1 框作为初始 visual prompt（带文本一起），
+        # 之后的框对同一 obj_id 做 refinement（必须 clear_old_boxes=False，否则
+        # 第一次的框会被清掉；并显式指定 obj_id，否则会被当作新对象）。
         try:
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                response = predictor.handle_request(add_prompt_req)
+                # 第 1 个框（含文本，如果有）
+                first_req = {
+                    "type": "add_prompt",
+                    "session_id": session_id,
+                    "frame_index": start_frame_idx,
+                    "bounding_boxes": [bounding_boxes[0]],
+                    "bounding_box_labels": [bounding_box_labels[0]],
+                }
+                if text_prompt:
+                    first_req["text"] = text_prompt
+                response = predictor.handle_request(first_req)
+
+                # 取第一次返回的 obj_id 用于后续 refinement
+                first_outputs = response.get("outputs") or {}
+                first_obj_ids = first_outputs.get("out_obj_ids", [])
+                if hasattr(first_obj_ids, "tolist"):
+                    first_obj_ids = first_obj_ids.tolist()
+                refine_obj_id = int(first_obj_ids[0]) if len(first_obj_ids) > 0 else 1
+
+                # 后续框逐个作为 refinement prompt 加到同一对象上
+                for i in range(1, len(bounding_boxes)):
+                    response = predictor.handle_request({
+                        "type": "add_prompt",
+                        "session_id": session_id,
+                        "frame_index": start_frame_idx,
+                        "bounding_boxes": [bounding_boxes[i]],
+                        "bounding_box_labels": [bounding_box_labels[i]],
+                        "obj_id": refine_obj_id,
+                        "clear_old_boxes": False,
+                    })
         except Exception as e:
             predictor.handle_request({"type": "close_session", "session_id": session_id})
             traceback.print_exc()
@@ -1297,14 +1387,14 @@ def track_video_box(video_path, vid_box_data, model_version, mask_mode=False,
         progress(1.0, desc="完成!")
         del frames
         _cleanup_gpu()
+        suffix = f"（{prompt_desc}）"
         if text_prompt:
-            return output_path, (f"✅ 框选+文本跟踪完成 ({model_version}): "
-                                 f"{n_objects} 个对象, {total} 帧 (文本: '{text_prompt}')")
-        else:
-            return output_path, f"✅ 框选跟踪完成 ({model_version}): {n_objects} 个对象, {total} 帧"
+            suffix += f" 文本: '{text_prompt}'"
+        return output_path, f"✅ 框选跟踪完成 ({model_version}): {n_objects} 个对象, {total} 帧 {suffix}"
 
     else:
-        # ---- SAM3 + 无文本：底层 tracker API（add_new_points_or_box） ----
+        # ---- SAM3 + 无文本 + 单正向框：底层 tracker API（add_new_points_or_box） ----
+        box_x1, box_y1, box_x2, box_y2 = pos_boxes[0][:4]
         try:
             tracker = _get_tracker(model_version, use_fa3=use_fa3)
         except Exception as e:
@@ -1392,8 +1482,8 @@ def clear_video_points(original_frame):
 
 
 # Video box UI helpers
-def on_video_box_click(display_img, original_frame, vid_box_data, pending_corner, evt: gr.SelectData):
-    """在视频首帧上点击画框"""
+def on_video_box_click(display_img, original_frame, vid_box_data, pending_corner, box_type, evt: gr.SelectData):
+    """在视频首帧上点击画框，支持正向框/负向框"""
     if original_frame is None:
         return display_img, vid_box_data, pending_corner, "⚠ 请先提取首帧"
     x, y = evt.index
@@ -1410,9 +1500,13 @@ def on_video_box_click(display_img, original_frame, vid_box_data, pending_corner
         x2, y2 = max(ax, x), max(ay, y)
         if x2 - x1 < 3 or y2 - y1 < 3:
             return display_img, vid_box_data, None, "⚠ 框太小，请重新点击"
-        vid_box_data = list(vid_box_data) + [(x1, y1, x2, y2, True)]
+        is_pos = box_type == "正向框（目标）"
+        vid_box_data = list(vid_box_data) + [(x1, y1, x2, y2, is_pos)]
         annotated = draw_boxes_on_image(original_frame.copy(), vid_box_data)
-        return annotated, vid_box_data, None, f"✅ 已标记 {len(vid_box_data)} 个框"
+        pos = sum(1 for b in vid_box_data if b[4])
+        neg = sum(1 for b in vid_box_data if not b[4])
+        return annotated, vid_box_data, None, f"已标记 {len(vid_box_data)} 个框（正向: {pos}, 负向: {neg}）"
+
 
 
 def clear_video_boxes(original_frame):
@@ -2220,6 +2314,11 @@ def build_ui():
 
                 # ---------- 框选跟踪 ----------
                 with gr.Tab("🔲 框选跟踪"):
+                    gr.Markdown(
+                        "在视频首帧点击画框：\n"
+                        "- 🟢 **正向框**：圈选目标  |  🔴 **负向框**：排除区域\n"
+                        "- 多框、含负向框或使用 SAM3.1 时自动走高层推理 API"
+                    )
                     vid_box_original = gr.State(None)
                     vid_box_data = gr.State([])
                     vid_box_pending = gr.State(None)
@@ -2233,6 +2332,10 @@ def build_ui():
                             vid_box_text = gr.Textbox(
                                 label="文本提示（可选）",
                                 placeholder="例如: person, car — 留空则仅用框选",
+                            )
+                            vid_box_type = gr.Radio(
+                                ["正向框（目标）", "负向框（排除）"],
+                                value="正向框（目标）", label="框类型",
                             )
                             with gr.Row():
                                 vid_box_extract = gr.Button(
@@ -2300,7 +2403,7 @@ def build_ui():
                     vid_box_frame.select(
                         on_video_box_click,
                         inputs=[vid_box_frame, vid_box_original,
-                                vid_box_data, vid_box_pending],
+                                vid_box_data, vid_box_pending, vid_box_type],
                         outputs=[vid_box_frame, vid_box_data,
                                  vid_box_pending, vid_box_status],
                     )
