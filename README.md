@@ -27,6 +27,7 @@
 - 支持 **Flash Attention 2** 开关（加速推理）
 - 视频跟踪支持 **自选中间帧** 标注（非仅首帧）
 - 输出支持 **叠加可视化** 和 **二值 Mask** 两种模式
+- 附带 [mask 二次加工 + HTTP API 范例](#范例活用-mask-做二次加工并封装为-api)（`face_grid_api.py`）
 
 ## 环境要求
 
@@ -197,12 +198,114 @@ sam = SAM3Inference(
 )
 ```
 
+## 范例：活用 mask 做二次加工并封装为 API
+
+`face_grid_api.py` 是一个完整的实战范例，演示两件在文档里不太好讲清楚的事：**怎么把 SAM 输出的 mask 真正用起来**，以及**怎么把 SAM 包成一个常驻 HTTP 服务**。它的业务功能是给检测到的目标叠加网格线（常用于人脸打码），但拆开看，里面的模式可以直接套用到任何"分割 + 后处理"的需求上。
+
+### 一、mask 不只是拿来抠图
+
+大多数示例到 `masks` 就结束了。这个范例展示 mask 作为**布尔蒙版参与像素运算**的用法，核心只有三步（见 [face_grid_api.py:410-424](face_grid_api.py#L410-L424)）：
+
+```python
+# 1. 多目标 mask 合并成一张：masks 形状 (N, 1, H, W) → (H, W) 的 bool
+combined_mask = torch.any(masks.squeeze(1), dim=0).cpu().numpy()
+
+# 2. 生成一个与图同尺寸的程序化图案（这里是任意角度的交叉网格）
+grid_pattern = create_grid_pattern(h, w, adj_lw, adj_ls, angle)
+
+# 3. 布尔与运算求交集 —— 图案只在目标区域内生效，背景不受影响
+apply_region = combined_mask & grid_pattern
+frame_out[apply_region] = 0
+```
+
+关键在第 3 步。`mask & pattern` 把"哪里是目标"和"画什么效果"彻底解耦：换掉 `create_grid_pattern`，就能变成马赛克、高斯模糊、纯色填充、贴图，而定位逻辑完全不用动。想反向操作（只处理背景、保留主体）也只需改成 `~combined_mask & pattern`。
+
+另外两个容易踩的点范例里也处理了：
+
+- **尺寸对不齐**：mask 分辨率不一定等于原图，合并后要用 `INTER_NEAREST` 缩放回原尺寸（[:414-418](face_grid_api.py#L414-L418)）。用默认的双线性插值会让 bool 边缘产生中间值，蒙版就糊了。
+- **根据目标大小自适应参数**：`inference_state["boxes"]` 里的检测框可以拿来反推目标尺度，进而动态调整效果强度。范例中 [compute_face_scale()](face_grid_api.py#L189) 让小脸用密网格、大脸用疏网格，避免固定参数在不同构图下失效。
+
+### 二、封装成 API 的几个要点
+
+直接跑起来：
+
+```bash
+python face_grid_api.py --port 8000 --version 3.0
+```
+
+启动后 `http://127.0.0.1:8000/docs` 有自动生成的交互式文档。
+
+> **注意监听地址。** `--host` 默认 `0.0.0.0`，即绑定所有网卡，局域网内任何人都能访问该端口上传文件并占用你的 GPU。服务本身没有认证机制，仅供内部或可信网络使用。只在本机调用时请显式指定 `--host 127.0.0.1`；需要对外提供服务时，在前面挂一层带鉴权的反向代理，不要直接暴露。
+
+Windows 下每次手动配环境变量比较烦，可以按需自建一个启动脚本（本地脚本已被 `.gitignore` 排除，不随仓库分发）。在项目根目录新建 `启动API服务.bat`：
+
+```bat
+@echo off
+chcp 65001 >nul
+
+set PYTHON=%CD%\SAM3mmgp_env\python.exe
+set FF_PATH=%CD%\ffmpeg-8.1-full_build-shared\bin
+set CONDA_LIB=%CD%\SAM3mmgp_env\Library\bin
+set CU_PATH=%CD%\SAM3mmgp_env\Lib\site-packages\torch\lib
+set SC_PATH=%CD%\SAM3mmgp_env\Scripts
+set PATH=%FF_PATH%;%CONDA_LIB%;%CU_PATH%;%SC_PATH%;%PATH%
+set HF_ENDPOINT=https://hf-mirror.com
+set HF_HOME=%CD%\.huggingface
+set TORCH_HOME=%CD%\.huggingface
+set XFORMERS_FORCE_DISABLE_TRITON=1
+set FFMPEG_PATH=%CD%\ffmpeg-8.1-full_build-shared\bin
+
+%PYTHON% face_grid_api.py ^
+--host 127.0.0.1 ^
+--port 8000 ^
+--version 3.0
+
+pause
+```
+
+其中 `PATH` 那几行是关键：ffmpeg 和 torch 的 DLL 目录必须在 Python 启动前就进 `PATH`，否则视频编码或 CUDA 初始化会失败。目录名按你自己的环境和 ffmpeg 版本调整。
+
+| 端点             | 说明                                |
+| ---------------- | ----------------------------------- |
+| `POST /process`  | 按文件扩展名自动分发到图片或视频    |
+| `POST /process/image` | 图片处理                       |
+| `POST /process/video` | 视频处理（逐帧跟踪）           |
+| `GET /health`    | 健康检查，返回模型加载状态          |
+
+表单参数：`prompt`（分割目标，默认 `face`）、`line_width`、`line_spacing`、`angle`。
+
+```bash
+# 默认分割人脸
+curl -X POST http://127.0.0.1:8000/process/image   -F "file=@photo.jpg" -o result.jpg
+
+# 换任意目标：prompt 接受任意名词短语
+curl -X POST http://127.0.0.1:8000/process/image   -F "file=@street.jpg" -F "prompt=truck" -o result.jpg
+
+# 调整网格外观
+curl -X POST http://127.0.0.1:8000/process/video   -F "file=@input.mp4" -F "prompt=person"   -F "line_width=3" -F "line_spacing=12" -F "angle=30" -o result.mp4
+```
+
+范例中值得照搬的几个做法：
+
+**模型常驻，不要每个请求重新加载。** 权重加载是秒级甚至十秒级开销，服务端必须复用。范例在启动时把图片模型和视频模型各加载成一个全局单例（`_image_processor` / `_predictor`，[:54-58](face_grid_api.py#L54-L58)），请求只做推理。
+
+**并发要串行化，但别阻塞事件循环。** SAM 的 `inference_state` 是有状态的，多请求并发写同一个 processor 会互相污染，所以推理段用 `threading.Lock` 保护（[:243](face_grid_api.py#L243)、[:373](face_grid_api.py#L373)），同一个模型同时只跑一个任务 —— 这不是性能妥协，是正确性要求。同时端点是 `async def`，推理必须用 `asyncio.to_thread` 丢到线程池（[:480](face_grid_api.py#L480)、[:540](face_grid_api.py#L540)），否则几十秒的同步推理会卡死整个服务，连 `/health` 都不响应。
+
+**每次推理后重置提示词。** `reset_all_prompts(inference_state)` 必须调用（[:411](face_grid_api.py#L411)），否则上一次请求的文本提示会残留到下一次，表现为"传了新 prompt 但结果还是旧目标"。
+
+**提示词失败要有回退。** 文本分割对措辞敏感，`face` 有时无结果而 `human face` 有。范例用 [build_prompt_candidates()](face_grid_api.py#L180) 按优先级依次尝试，命中即止；且只对人体类提示词追加 `human` 前缀 —— 给 `car` 加前缀变成 `human car` 毫无意义。
+
+**没检测到目标时的行为要明确区分。** 图片端点返回原图（打码场景下"没脸可打"是正常结果），视频端点返回 `422` 并说明未命中的提示词（整段视频都没有目标，更可能是提示词写错了）。
+
+**临时文件用 `BackgroundTask` 清理。** 响应体还没发完就删文件会截断传输，挂在后台任务里等发送完成后再删。
+
 ## 项目结构
 
 ```
 SAM3easyuse/
 ├── gradio_app.py        # Gradio Web UI
 ├── inference.py         # SAM3Inference 类 + CLI
+├── face_grid_api.py     # 范例：mask 二次加工 + FastAPI 服务
 ├── requirements.txt     # Python 依赖
 ├── sam3/                # SAM3 源码 (git submodule)
 │   ├── checkpoints/     # 模型权重 (需自行下载)

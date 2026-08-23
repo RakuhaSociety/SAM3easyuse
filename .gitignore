@@ -56,3 +56,6 @@ TODO.md
 
 # ===== test data set =====
 assets
+
+# ===== API 服务临时文件 =====
+api_temp/
