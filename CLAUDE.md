@@ -26,8 +26,8 @@ Run these with the env vars above already set (that is what the local `.bat` wra
 # Gradio Web UI on :7860 — note gradio_app.py binds 0.0.0.0
 SAM3mmgp_env\python.exe gradio_app.py
 
-# FastAPI grid-line service — --host defaults to 0.0.0.0 with no auth; pass 127.0.0.1 for local-only
-SAM3mmgp_env\python.exe face_grid_api.py --host 127.0.0.1 --port 8000 --version 3.0
+# FastAPI grid-line service — --host defaults to 127.0.0.1; 0.0.0.0 exposes an unauthenticated service on the LAN
+SAM3mmgp_env\python.exe face_grid_api.py --port 8000 --version 3.0
 
 # CLI — subcommands: image-text, image-box, image-points, batch,
 #                    video-text, video-points, video-box
